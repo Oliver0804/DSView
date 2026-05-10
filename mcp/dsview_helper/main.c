@@ -943,6 +943,7 @@ int main(int argc, char **argv)
     const char *input    = NULL;
     const char *map      = NULL;
     const char *options  = NULL;
+    const char *stack    = NULL;
     const char *decoders_dir = NULL;
     uint64_t samplerate = 0;
     uint64_t depth = 0;
@@ -996,6 +997,7 @@ int main(int argc, char **argv)
         {"start",        required_argument, 0, 'S'},
         {"end",          required_argument, 0, 'E'},
         {"limit",        required_argument, 0, 'L'},
+        {"stack",        required_argument, 0, 1013},
         {"verbose",      no_argument,       0, 'v'},
         {"help",         no_argument,       0, 'h'},
         {0, 0, 0, 0}
@@ -1040,6 +1042,7 @@ int main(int argc, char **argv)
         }
         case 1011: opts.trigger_pos_pct = atoi(optarg); break;
         case 1012: bind_index = atoi(optarg); break;
+        case 1013: stack       = optarg;       break;
         case 'f': firmware   = optarg;       break;
         case 'u': user_data  = optarg;       break;
         case 'P': protocol   = optarg;       break;
@@ -1077,8 +1080,8 @@ int main(int argc, char **argv)
             emit_error("decode: --input, --protocol, --map are required");
             return 64;
         }
-        return cmd_decode(input, protocol, map, options, decoders_dir,
-                          start_sample, end_sample, limit);
+        return cmd_decode(input, protocol, map, options, stack,
+                          decoders_dir, start_sample, end_sample, limit);
     } else {
         usage(argv[0]);
         return 64;

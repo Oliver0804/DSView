@@ -329,6 +329,7 @@ int cmd_decode(const char *input_prefix,
                const char *protocol,
                const char *map_csv,
                const char *options_csv,
+               const char *stack_csv,
                const char *decoders_dir,
                long long start_sample,
                long long end_sample,
@@ -543,6 +544,51 @@ int cmd_decode(const char *input_prefix,
         srd_session_destroy(sess); srd_exit();
         g_free(json_path); g_free(bin_path); g_free(bin);
         return 1;
+    }
+
+    /* --- stacked decoders ---
+     * `stack_csv` is a comma-separated list of upper-layer protocol ids
+     * to stack on top of the base inst. The DSL fork prefixes the same
+     * protocol id with `0:` / `1:` for two variants — pass through
+     * verbatim, falling back to `:` -> `-` rewrite for the Python
+     * module name. Per-stack options are not exposed yet; most common
+     * stacks (24xx EEPROM, spiflash, mdio) work with defaults. */
+    if (stack_csv && *stack_csv) {
+        char *dup = g_strdup(stack_csv);
+        struct srd_decoder_inst *prev = di;
+        for (char *tok = strtok(dup, ","); tok; tok = strtok(NULL, ",")) {
+            char *id = g_strstrip(tok);
+            if (!*id) continue;
+
+            int rc2 = srd_decoder_load(id);
+            if (rc2 != SRD_OK) {
+                char *alt = g_strdup(id);
+                for (char *p = alt; *p; p++) if (*p == ':') *p = '-';
+                rc2 = srd_decoder_load(alt);
+                g_free(alt);
+            }
+            if (rc2 != SRD_OK) {
+                fprintf(stderr, "warning: stacked decoder '%s' load failed: %s\n",
+                        id, srd_strerror(rc2));
+                continue;
+            }
+            GHashTable *uopts = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                      g_free,
+                                                      (GDestroyNotify)g_variant_unref);
+            struct srd_decoder_inst *uinst = srd_inst_new(sess, id, uopts);
+            g_hash_table_destroy(uopts);
+            if (!uinst) {
+                fprintf(stderr, "warning: srd_inst_new failed for stacked '%s'\n",
+                        id);
+                continue;
+            }
+            if (srd_inst_stack(sess, prev, uinst) != SRD_OK) {
+                fprintf(stderr, "warning: srd_inst_stack failed for '%s'\n", id);
+                continue;
+            }
+            prev = uinst;
+        }
+        g_free(dup);
     }
 
     ann_state.count = 0;

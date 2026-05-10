@@ -850,6 +850,7 @@ def decode(
     end_sample: int = 0,
     limit: int = 5000,
     output: str = "summary",
+    stack: list[str] | str | None = None,
 ) -> dict[str, Any]:
     """Run a protocol decoder over a captured logic trace.
 
@@ -873,6 +874,16 @@ def decode(
         limit:      max raw annotations to read from helper (default 5000).
         output:     "summary" (default, ~100x cheaper) or "raw" (every
                      annotation including bit-level entries).
+        stack:      list (or comma-separated string) of upper-layer
+                     decoder ids to stack on the base. e.g. ["24xx"]
+                     on top of "1:i2c" exposes 24xx EEPROM operations
+                     (R/W/Sequential read, address bytes, data bytes)
+                     in the streams + events. Common stacks:
+                       - i2c → "24xx" (24Cxx EEPROM)
+                       - i2c → "ds1307" (real-time clock)
+                       - spi → "spiflash" (xx25 SPI flash chips)
+                       - spi → "sdcard_spi"
+                       - uart → "modbus"
 
     Returns (output="summary"):
         {"protocol": str, "samplerate": int, "window_samples": int,
@@ -918,6 +929,10 @@ def decode(
         args += ["--start", str(start_sample)]
     if end_sample:
         args += ["--end", str(end_sample)]
+    if stack:
+        stack_csv = stack if isinstance(stack, str) else ",".join(stack)
+        if stack_csv:
+            args += ["--stack", stack_csv]
 
     res = _run_helper(args, timeout=120)
     res.pop("ok", None)
