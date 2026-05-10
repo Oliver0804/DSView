@@ -1976,7 +1976,7 @@ _WORKFLOWS = [
             "        channels=[0], vth=0.9, name='uart-tx',"
             "        confirm=True)",
             "analyze(capture_id=..., channel=0)"
-            "  # estimated_freq_hz / pulse_width to back out baudrate",
+            "  # frequency_hz / pulse_width_s to back out baudrate",
             "decode(capture_id=..., protocol='1:uart',"
             "       channel_map={'rxtx': 0},"
             "       options={'baudrate': 115200, 'num_data_bits': 8})",
@@ -1988,16 +1988,44 @@ _WORKFLOWS = [
                    "channel mappings without re-capturing.",
         "steps": [
             "capture(..., channels=[0,1,2,3], name='spi-probe', confirm=True)",
-            "# Try the obvious mapping first",
+            "# 1) Find the CLK pin in ONE call (no read_window needed):",
+            "stats = analyze(capture_id=..., channel=[0,1,2,3])",
+            "clk_idx = next(c['channel'] for c in stats['channels']"
+            "              if c.get('is_clock'))",
+            "# stats also gives you frequency_hz so you know the SPI rate.",
+            "",
+            "# 2) Try the obvious mapping with the detected CLK:",
             "decode(capture_id=..., protocol='1:spi',"
-            "       channel_map={'clk':0,'mosi':1,'miso':2,'cs':3},"
+            "       channel_map={'clk':clk_idx,'mosi':1,'miso':2,'cs':3},"
             "       options={'cpol':0,'cpha':0,'cs_polarity':'active-low'})",
-            "# Got 0 byte? Swap MOSI/MISO and tweak cpol/cpha:",
-            "for clk_idx in (0,1,2,3):",
-            "    for mosi, miso in [(1,2),(2,1)]:",
-            "        decode(... channel_map={'clk':clk_idx,'mosi':mosi,...})",
-            "# read_window(capture_id=..., channel=clk_idx) shows which "
-            "  pin actually carries the clock.",
+            "",
+            "# 3) Got 0 bytes? Swap MOSI/MISO and tweak cpol/cpha:",
+            "for mosi, miso in [(1,2),(2,1)]:",
+            "    decode(... channel_map={'clk':clk_idx,'mosi':mosi,...})",
+        ],
+    },
+    {
+        "name": "verify-clock-pin",
+        "purpose": "Cheapest way to check whether a candidate pin is "
+                   "actually a clock (SCK/SCL/CLK) and at what rate — "
+                   "skip raw-bit reads, save context tokens.",
+        "steps": [
+            "# Capture the suspected clock plus a few neighbours:",
+            "cap = capture(index=2, samplerate=25_000_000, depth=200_000,",
+            "              channels=[0,1,2,3], name='clk-probe', confirm=True)",
+            "",
+            "# One analyze call gives a verdict per channel:",
+            "r = analyze(cap['capture_id'])  # all enabled",
+            "for ch in r['channels']:",
+            "    if ch.get('is_clock'):",
+            "        print(ch['channel'], ch['frequency_hz'],"
+            "              'jitter_cv=', ch['period_jitter_cv'])",
+            "# Decision keys:",
+            "#   is_clock         — heuristic verdict",
+            "#   frequency_hz     — clock rate (median rising-rising)",
+            "#   period_jitter_cv — clean clock < 0.05; data >> 0.20",
+            "#   duty_cycle       — clean clock ≈ 0.50",
+            "# No need for read_window unless is_clock is ambiguous.",
         ],
     },
     {
