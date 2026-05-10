@@ -714,6 +714,205 @@ def decode(
     }
 
 
+# ---------------------------------------------------------------------------
+# GUI bridge: forward calls to the McpServer embedded in DSView.exe
+# ---------------------------------------------------------------------------
+#
+# When DSView is running with the embedded MCP server enabled (Help menu →
+# MCP Server, or DSVIEW_MCP_AUTOSTART=1), it listens on 127.0.0.1:7384 and
+# exposes JSON-RPC methods that drive the live GUI session — the same place
+# the user sees waveforms, decoder annotations, and toolbar buttons.
+#
+# The standalone helper-based tools above (capture/decode/...) work even
+# without the GUI, but operate on a private SigSession; the user can't see
+# what the LLM is doing. The `gui_*` family below routes through 7384 so
+# every action (a capture, a config change, a button press) is reflected
+# in the visible GUI window.
+#
+# These two paths are *both* useful:
+#   - stdio path  → headless / CI / exclusive hardware access
+#   - gui_* path  → interactive debugging where the human watches along
+#
+# The gui_* tools degrade gracefully: if 7384 is closed they return a hint
+# explaining how to enable it.
+
+import socket as _socket
+
+_GUI_HOST = "127.0.0.1"
+_GUI_PORT = 7384
+
+
+def _gui_call(method: str, params: dict | None = None,
+              timeout: float = 10.0) -> dict[str, Any]:
+    """Send one JSON-RPC request to the embedded MCP server in DSView.
+
+    Returns the raw JSON-RPC response object (`{id, jsonrpc, result|error}`).
+    Raises ConnectionRefusedError when the GUI server is not listening.
+    """
+    sock = _socket.create_connection((_GUI_HOST, _GUI_PORT), timeout=timeout)
+    sock.settimeout(timeout)
+    try:
+        req = {"jsonrpc": "2.0", "id": 1, "method": method}
+        if params is not None:
+            req["params"] = params
+        sock.sendall((json.dumps(req) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        sock.close()
+    return json.loads(buf.decode().strip())
+
+
+def _gui_invoke(method: str, params: dict | None = None,
+                timeout: float = 10.0) -> dict[str, Any]:
+    """High-level wrapper used by every gui_* tool. Translates connection
+    refused / RPC error into structured tool output the LLM can act on."""
+    try:
+        rsp = _gui_call(method, params, timeout=timeout)
+    except (ConnectionRefusedError, OSError) as e:
+        return {
+            "ok": False,
+            "gui_running": False,
+            "hint": (
+                "DSView's embedded MCP server is not reachable at "
+                f"{_GUI_HOST}:{_GUI_PORT}. Open DSView and either: "
+                "1) toggle Help menu → 'MCP Server (port 7384)', or "
+                "2) launch with DSVIEW_MCP_AUTOSTART=1."
+            ),
+            "error": str(e),
+        }
+    if "error" in rsp:
+        return {"ok": False, "gui_running": True, "error": rsp["error"]}
+    return {"ok": True, "gui_running": True, **(rsp.get("result") or {})}
+
+
+@mcp.tool()
+def gui_state() -> dict[str, Any]:
+    """Snapshot of the live DSView GUI: active device, samplerate, depth,
+    collect mode, whether a capture is in flight, MCP listener status."""
+    return _gui_invoke("get_state")
+
+
+@mcp.tool()
+def gui_screenshot(path: str | None = None,
+                   max_width: int | None = 1280) -> dict[str, Any]:
+    """Save a PNG screenshot of the DSView main window. Returns the file
+    path so the caller can open it with a vision-capable model.
+
+    Args:
+        path: optional output file path; defaults to /tmp/dsview_screenshot_*.png.
+        max_width: downscale to this width in pixels (default 1280, set to
+            None or 0 to keep full resolution — full-HD PNG can be ~400KB).
+    """
+    p: dict[str, Any] = {}
+    if path:                       p["path"] = path
+    if max_width and max_width > 0: p["max_width"] = int(max_width)
+    return _gui_invoke("screenshot", p, timeout=15.0)
+
+
+@mcp.tool()
+def gui_run_start() -> dict[str, Any]:
+    """Press the toolbar 'Start' button — begin a normal capture in DSView.
+    Same as calling SigSession::start_capture(false)."""
+    return _gui_invoke("run_start")
+
+
+@mcp.tool()
+def gui_run_stop() -> dict[str, Any]:
+    """Press the toolbar 'Stop' button — abort an in-flight capture."""
+    return _gui_invoke("run_stop")
+
+
+@mcp.tool()
+def gui_instant_shot() -> dict[str, Any]:
+    """Press the toolbar 'Instant' button — single-shot quick capture."""
+    return _gui_invoke("instant_shot")
+
+
+@mcp.tool()
+def gui_set_collect_mode(mode: str) -> dict[str, Any]:
+    """Pick the toolbar capture-mode dropdown.
+
+    Args:
+        mode: 'single' | 'repeat' | 'loop'.
+    """
+    return _gui_invoke("set_collect_mode", {"mode": mode})
+
+
+@mcp.tool()
+def gui_set_active_device(index: int) -> dict[str, Any]:
+    """Switch the toolbar device dropdown to the given index (from
+    list_devices). Note: the underlying call updates the libsigrok driver
+    state; current versions may not redraw the GUI's device combo until
+    the user clicks once. Use gui_state to verify."""
+    return _gui_invoke("set_active_device", {"index": int(index)})
+
+
+@mcp.tool()
+def gui_set_config(
+    samplerate: int | None = None,
+    depth: int | None = None,
+    vth: float | None = None,
+    operation_mode: int | None = None,
+    buffer_option: int | None = None,
+    filter: int | None = None,         # noqa: A002 — mirrors GUI label
+    channel_mode: int | None = None,
+    rle: bool | None = None,
+    ext_clock: bool | None = None,
+    falling_edge_clock: bool | None = None,
+    max_height: str | None = None,
+) -> dict[str, Any]:
+    """Drive the 'Options' (設備選項) dialog and the samplerate/depth
+    dropdowns in one call. Pass only the fields you want to change; the
+    rest stay at the GUI's current values.
+
+    Returns `{applied: {...}, errors: {...}}` per key — some options
+    (filter / operation_mode / channel_mode) may be rejected by the
+    driver depending on the device's current state, in which case they
+    end up in `errors`."""
+    p: dict[str, Any] = {}
+    for k, v in (
+        ("samplerate", samplerate), ("depth", depth), ("vth", vth),
+        ("operation_mode", operation_mode), ("buffer_option", buffer_option),
+        ("filter", filter), ("channel_mode", channel_mode),
+        ("rle", rle), ("ext_clock", ext_clock),
+        ("falling_edge_clock", falling_edge_clock),
+        ("max_height", max_height),
+    ):
+        if v is not None:
+            p[k] = v
+    if not p:
+        return {"ok": True, "applied": {}, "hint": "no fields specified"}
+    return _gui_invoke("set_config", p)
+
+
+@mcp.tool()
+def gui_set_channel(channels: dict[str, bool] | None = None,
+                    index: int | None = None,
+                    enabled: bool | None = None) -> dict[str, Any]:
+    """Enable/disable logic channels.
+
+    Args:
+        channels: batch map like {"0": true, "1": false, ...} (keys as str).
+        index / enabled: single-channel form, e.g. index=5, enabled=True.
+    """
+    p: dict[str, Any] = {}
+    if channels is not None:
+        # normalize int keys → str so the JSON object is well-formed
+        p["channels"] = {str(k): bool(v) for k, v in channels.items()}
+    if index is not None:
+        p["index"] = int(index)
+        if enabled is not None:
+            p["enabled"] = bool(enabled)
+    if not p:
+        return {"ok": False, "hint": "pass channels=... or index=...,enabled=..."}
+    return _gui_invoke("set_channel", p)
+
+
 def main() -> None:
     mcp.run()
 

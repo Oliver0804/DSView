@@ -378,13 +378,18 @@ QJsonObject McpServer::toolRunStart(const QJsonObject &params, QString *err)
 
 QJsonObject McpServer::toolRunStop(const QJsonObject &params, QString *err)
 {
-    Q_UNUSED(params);
+    Q_UNUSED(params); Q_UNUSED(err);
     if (!_session) { if (err) *err = "no SigSession"; return {}; }
-    if (!_session->stop_capture()) {
-        if (err) *err = "stop_capture() failed";
-        return {};
+    QJsonObject r; r["action"] = "run_stop";
+    if (!_session->is_working()) {
+        r["ok"] = true;
+        r["already_stopped"] = true;
+        return r;
     }
-    QJsonObject r; r["ok"] = true; r["action"] = "run_stop"; return r;
+    bool ok = _session->stop_capture();
+    r["ok"] = ok;
+    if (!ok && err) *err = "stop_capture() failed";
+    return r;
 }
 
 QJsonObject McpServer::toolInstantShot(const QJsonObject &params, QString *err)
@@ -463,6 +468,15 @@ QJsonObject McpServer::toolSetCollectMode(const QJsonObject &params,
                                           QString *err)
 {
     if (!_session) { if (err) *err = "no SigSession"; return {}; }
+
+    /* SigSession::set_collect_mode() asserts !_is_working — calling it
+     * mid-capture would SIGABRT the entire GUI. Refuse early instead. */
+    if (_session->is_working()) {
+        if (err) *err = "device is currently capturing; call run_stop "
+                        "first before changing collect mode";
+        return {};
+    }
+
     QString m = params.value("mode").toString().toLower();
     DEVICE_COLLECT_MODE cm;
     if (m == "single")        cm = COLLECT_SINGLE;
