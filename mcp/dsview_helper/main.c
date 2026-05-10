@@ -214,7 +214,7 @@ static int cmd_list_devices(const char *firmware_dir, const char *user_data_dir)
     }
 
     /* Hotplug needs a brief moment to enumerate. */
-    usleep(300 * 1000);
+    usleep(600 * 1000);
     ds_reload_device_list();
 
     struct ds_device_base_info *arr = NULL;
@@ -276,7 +276,7 @@ static int cmd_device_info(int index, const char *firmware_dir,
     int rc = ensure_lib_init(firmware_dir, user_data_dir);
     if (rc != SR_OK) { emit_error("ds_lib_init failed"); return 1; }
 
-    usleep(300 * 1000);
+    usleep(600 * 1000);
     if ((rc = activate_index(index)) != SR_OK) {
         emit_error("activate device %d failed: %s", index, sr_error_str(rc));
         return 1;
@@ -371,7 +371,7 @@ static int cmd_capture(int index, const char *output_prefix,
     int rc = ensure_lib_init(firmware_dir, user_data_dir);
     if (rc != SR_OK) { emit_error("ds_lib_init failed"); return 1; }
 
-    usleep(300 * 1000);
+    usleep(600 * 1000);
 
     /* Snapshot the device list *before* activation so we can verify the
      * activate request actually landed on the slot we asked for. USB

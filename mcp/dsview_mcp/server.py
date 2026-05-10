@@ -86,8 +86,14 @@ class HelperError(RuntimeError):
     pass
 
 
-def _run_helper(args: list[str], timeout: int = 60) -> dict[str, Any]:
-    """Run dsview_helper with the given args and parse its JSON stdout."""
+def _run_helper(args: list[str], timeout: int = 60,
+                retries: int = 2) -> dict[str, Any]:
+    """Run dsview_helper with the given args and parse its JSON stdout.
+
+    Retries up to `retries` times on USB-exclusion / active-device
+    mismatch errors (with a 0.6s settle delay between attempts), since
+    those are nearly always transient hotplug-enumeration races on a
+    machine with multiple DSLogic units."""
     if not HELPER.exists():
         raise HelperError(
             f"dsview_helper not found at {HELPER}. "
@@ -99,29 +105,44 @@ def _run_helper(args: list[str], timeout: int = 60) -> dict[str, Any]:
         "--user-data", str(USER_DATA_DIR),
         "--decoders-dir", str(DECODERS_DIR),
     ]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise HelperError(f"helper timed out: {' '.join(cmd)}") from e
 
-    out = proc.stdout.strip().splitlines()
-    if not out:
-        raise HelperError(
-            f"helper produced no output (rc={proc.returncode}); "
-            f"stderr: {proc.stderr.strip()[-500:]}"
-        )
-    try:
-        result = json.loads(out[-1])
-    except json.JSONDecodeError as e:
-        raise HelperError(
-            f"helper returned non-JSON: {out[-1][:200]!r}; stderr: "
-            f"{proc.stderr.strip()[-500:]}"
-        ) from e
+    last_msg: str | None = None
+    for attempt in range(retries + 1):
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise HelperError(f"helper timed out: {' '.join(cmd)}") from e
 
-    if not result.get("ok", False):
-        msg = result.get("error", "unknown helper error")
+        out = proc.stdout.strip().splitlines()
+        if not out:
+            raise HelperError(
+                f"helper produced no output (rc={proc.returncode}); "
+                f"stderr: {proc.stderr.strip()[-500:]}"
+            )
+        try:
+            result = json.loads(out[-1])
+        except json.JSONDecodeError as e:
+            raise HelperError(
+                f"helper returned non-JSON: {out[-1][:200]!r}; stderr: "
+                f"{proc.stderr.strip()[-500:]}"
+            ) from e
+
+        if result.get("ok", False):
+            return result
+
+        last_msg = result.get("error", "unknown helper error")
+        # Only retry transient USB races, not config errors.
+        transient = ("active-device mismatch" in last_msg
+                     or "USB exclusion" in last_msg
+                     or ("open" in last_msg.lower()
+                         and "fail" in last_msg.lower()))
+        if attempt < retries and transient:
+            time.sleep(0.6)
+            continue
+
+        msg = last_msg
         # Make common failures actionable for the LLM.
         if "active-device mismatch" in msg or "USB exclusion" in msg:
             msg += ("\n\nHint: another process is holding the requested "
