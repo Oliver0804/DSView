@@ -4,8 +4,14 @@
  */
 #include "mcpserver.h"
 
+#include <QBuffer>
+#include <QByteArray>
+#include <QDateTime>
+#include <QDir>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QPixmap>
 #include <QString>
 
 #include <libsigrok.h>
@@ -246,6 +252,53 @@ QJsonObject McpServer::toolDecode(const QJsonObject &params, QString *err)
         *err = "decode() not implemented in embedded MCP yet — "
                "fall back to the standalone helper";
     return QJsonObject();
+}
+
+/* Grab the DSView main window and write it as PNG to a path the LLM can
+ * read with its file/Image tooling. Returning the bytes directly would
+ * blow up the JSON-RPC channel (a 1920×1170 PNG is ~400KB / ~530KB
+ * base64 / ~130k tokens), so we write to disk and report the path. */
+QJsonObject McpServer::toolScreenshot(const QJsonObject &params, QString *err)
+{
+    if (!_main_window) {
+        if (err) *err = "main window unavailable";
+        return QJsonObject();
+    }
+
+    QString path = params.value("path").toString();
+    if (path.isEmpty()) {
+        path = QDir::tempPath()
+             + QStringLiteral("/dsview_screenshot_%1.png")
+                .arg(QDateTime::currentMSecsSinceEpoch());
+    }
+
+    QPixmap pix = _main_window->grab();
+    if (pix.isNull()) {
+        if (err) *err = "QWidget::grab() returned null";
+        return QJsonObject();
+    }
+
+    /* Optional downscale to keep the file vision-friendly. */
+    int max_w = params.value("max_width").toInt(0);
+    if (max_w > 0 && pix.width() > max_w) {
+        pix = pix.scaledToWidth(max_w, Qt::SmoothTransformation);
+    }
+
+    int quality = params.value("quality").toInt(-1);
+    Q_UNUSED(quality); /* PNG ignores quality, kept for API symmetry. */
+
+    if (!pix.save(path, "PNG")) {
+        if (err) *err = QStringLiteral("failed to save PNG to %1").arg(path);
+        return QJsonObject();
+    }
+
+    QFileInfo fi(path);
+    QJsonObject r;
+    r["path"]   = fi.absoluteFilePath();
+    r["width"]  = pix.width();
+    r["height"] = pix.height();
+    r["bytes"]  = (qint64)fi.size();
+    return r;
 }
 
 } // namespace mcp

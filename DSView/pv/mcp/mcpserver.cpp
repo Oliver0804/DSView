@@ -150,6 +150,8 @@ void McpServer::handleLine(QTcpSocket *sock, const QByteArray &line)
         return;
     } else if (method == "decode") {
         result = toolDecode(par, &err);
+    } else if (method == "screenshot") {
+        result = toolScreenshot(par, &err);
     } else {
         writeError(sock, id, -32601,
                    QStringLiteral("Method not found: %1").arg(method));

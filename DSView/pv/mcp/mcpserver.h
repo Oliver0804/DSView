@@ -82,6 +82,7 @@ private:
                           const QJsonObject &params, QString *err);
 
     QJsonObject toolDecode(const QJsonObject &params, QString *err);
+    QJsonObject toolScreenshot(const QJsonObject &params, QString *err);
 
 private:
     QTcpServer            _server;

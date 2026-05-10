@@ -146,8 +146,17 @@ namespace pv
 
         /* Embedded MCP server — created upfront so the log dialog can be
          * opened at any time, but not started until the user toggles
-         * "MCP Server" in the Help menu (LogoBar). */
+         * "MCP Server" in the Help menu (LogoBar). Set the env var
+         * DSVIEW_MCP_AUTOSTART=1 to bring it up automatically (handy for
+         * scripted / headless usage). */
         _mcp_server = new pv::mcp::McpServer(_session, this, this);
+
+        QByteArray envAuto = qgetenv("DSVIEW_MCP_AUTOSTART");
+        if (!envAuto.isEmpty() && envAuto != "0") {
+            if (!_mcp_server->start(MCP_DEFAULT_PORT))
+                dsv_warn("MCP autostart failed (port %u in use?)",
+                         MCP_DEFAULT_PORT);
+        }
     }
 
     void MainWindow::setup_ui()
