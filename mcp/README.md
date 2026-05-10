@@ -156,6 +156,27 @@ claude mcp add dsview \
 | `DSVIEW_DECODERS_DIR` | `libsigrokdecode4DSL/decoders` | 協議解碼器目錄 |
 | `DSVIEW_USER_DATA_DIR` | `~/.dsview` | 使用者資料夾 |
 | `DSVIEW_WORKDIR` | `~/.dsview/captures` | capture 結果存放處 |
+| `DSVIEW_USE_DAEMON_POOL` | `0` | 設 `1` 啟用 per-USB-device 常駐 daemon（避免多 Plus hotplug race，hot capture 省 ~1.2s/次）|
+| `DSVIEW_BINARY` | autodetect | DSView GUI binary 路徑（給 `launch_gui` 用）|
+| `DSVIEW_MCP_AUTOSTART` | `0` | 設 `1` 讓 GUI 啟動時自動開 7384 MCP server |
+| `DSVIEW_DEFAULT_DEVICE` | (空) | GUI 啟動時偏好的 device name 子字串（如 `demo` 留 USB 給 stdio）|
+
+### Daemon pool（多 DSLogic 並行進階）
+
+預設 helper 是 spawn-on-call — 每次 capture 都 fork 一個短命 process。
+兩台以上 DSLogic Plus 同時接時，hotplug enumeration 會跟 spawn 競爭，
+偶爾 active-device 切錯（可由 metadata.active_device_handle 驗證 +
+自動 retry）。
+
+設 `DSVIEW_USE_DAEMON_POOL=1` 啟用 daemon pool：
+
+- Demo Device（virtual）仍走 spawn-on-call（cheap）
+- USB device 第一次 capture 時 lazy spawn `dsview_helper daemon
+  --bind-index N`，常駐持有那個 device handle
+- 後續 capture / device_info 走 stdin/stdout JSON-RPC 跟同一個 daemon
+  溝通 — 沒有 lib_init / hotplug enumerate 開銷
+- `daemon_pool_status()` MCP tool 看池內 daemon 列表
+- 程式結束時 atexit 自動 shutdown daemons
 
 ### 直接測試 helper（不經 MCP）
 

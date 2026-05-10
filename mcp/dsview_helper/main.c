@@ -704,6 +704,212 @@ static int cmd_capture(int index, const char *output_prefix,
     return g.error_flag ? 2 : 0;
 }
 
+/* ---- subcommand: daemon (long-running, fixed-bind) -------------------- */
+
+/* Tiny JSON-line scanners. The daemon protocol is one request per stdin
+ * line, well-formed compact JSON; we only ever look up known keys. */
+
+static char *json_get_str(const char *src, const char *key,
+                          char *out, size_t outlen)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(src, pat);
+    if (!p) { out[0] = '\0'; return NULL; }
+    p += strlen(pat);
+    const char *e = strchr(p, '"');
+    if (!e) { out[0] = '\0'; return NULL; }
+    size_t n = (size_t)(e - p);
+    if (n >= outlen) n = outlen - 1;
+    memcpy(out, p, n);
+    out[n] = '\0';
+    return out;
+}
+
+static long json_get_int(const char *src, const char *key, long def_v)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(src, pat);
+    if (!p) return def_v;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == 'n' && strncmp(p, "null", 4) == 0) return def_v;
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    return (end == p) ? def_v : v;
+}
+
+static double json_get_double(const char *src, const char *key, double def_v)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":", key);
+    const char *p = strstr(src, pat);
+    if (!p) return def_v;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == 'n' && strncmp(p, "null", 4) == 0) return def_v;
+    char *end = NULL;
+    double v = strtod(p, &end);
+    return (end == p) ? def_v : v;
+}
+
+static char parse_trigger_edge_word(const char *s)
+{
+    if (!s || !*s) return 'X';
+    char c = s[0];
+    if (c == 'R' || c == 'F' || c == 'C' || c == '1' || c == '0' ||
+        c == 'r' || c == 'f' || c == 'c')
+        return (c >= 'a' && c <= 'z') ? c - 32 : c;
+    if (!strcasecmp(s, "rising"))  return 'R';
+    if (!strcasecmp(s, "falling")) return 'F';
+    if (!strcasecmp(s, "either") || !strcasecmp(s, "edge")) return 'C';
+    if (!strcasecmp(s, "high"))    return '1';
+    if (!strcasecmp(s, "low"))     return '0';
+    return 'X';
+}
+
+static int cmd_daemon(int bind_index,
+                      const char *firmware_dir,
+                      const char *user_data_dir)
+{
+    int rc = ensure_lib_init(firmware_dir, user_data_dir);
+    if (rc != SR_OK) {
+        emit_error("daemon: ds_lib_init failed: %s", sr_error_str(rc));
+        return 1;
+    }
+    usleep(600 * 1000);
+
+    /* Snapshot device list before activate so we can report what we
+     * actually got bound to. */
+    char bound_name[150] = {0};
+    unsigned long long bound_handle = 0;
+    {
+        ds_reload_device_list();
+        struct ds_device_base_info *arr = NULL;
+        int count = 0;
+        if (ds_get_device_list(&arr, &count) == SR_OK && arr
+                && bind_index >= 0 && bind_index < count) {
+            bound_handle = (unsigned long long)arr[bind_index].handle;
+            strncpy(bound_name, arr[bind_index].name,
+                    sizeof(bound_name) - 1);
+        }
+        if (arr) g_free(arr);
+    }
+
+    rc = ds_active_device_by_index(bind_index);
+    if (rc != SR_OK) {
+        emit_error("daemon: activate index %d failed: %s",
+                   bind_index, sr_error_str(rc));
+        return 1;
+    }
+
+    /* Verify by handle — same protection as cmd_capture has. */
+    {
+        struct ds_device_full_info dinfo;
+        memset(&dinfo, 0, sizeof(dinfo));
+        ds_get_actived_device_info(&dinfo);
+        if (bound_handle != 0
+                && bound_handle != (unsigned long long)dinfo.handle) {
+            emit_error("daemon: bound index %d resolved to handle %llu "
+                       "(%s) but lib activated handle %llu (%s)",
+                       bind_index, bound_handle, bound_name,
+                       (unsigned long long)dinfo.handle, dinfo.name);
+            return 1;
+        }
+    }
+
+    /* Tell the parent we're bound and ready. One JSON line. */
+    char esc_name[300];
+    printf("{\"ok\":true,\"daemon\":true,\"index\":%d,"
+           "\"name\":\"%s\",\"handle\":%llu}\n",
+           bind_index,
+           json_escape(bound_name, esc_name, sizeof(esc_name)),
+           bound_handle);
+    fflush(stdout);
+
+    /* Main request loop. One JSON request per line on stdin; one JSON
+     * response line on stdout. The reused cmd_* helpers already print
+     * single-line JSON results to stdout, so we mostly just dispatch
+     * them and fflush. */
+    char line[8192];
+    while (fgets(line, sizeof(line), stdin)) {
+        char method[64];
+        json_get_str(line, "method", method, sizeof(method));
+
+        if (!strcmp(method, "ping")) {
+            printf("{\"ok\":true,\"pong\":true,\"index\":%d}\n",
+                   bind_index);
+            fflush(stdout);
+            continue;
+        }
+        if (!strcmp(method, "shutdown")) {
+            printf("{\"ok\":true,\"shutdown\":true}\n");
+            fflush(stdout);
+            return 0;
+        }
+        if (!strcmp(method, "device_info")) {
+            cmd_device_info(bind_index, firmware_dir, user_data_dir);
+            fflush(stdout);
+            continue;
+        }
+        if (!strcmp(method, "capture")) {
+            char output[512];
+            json_get_str(line, "output", output, sizeof(output));
+            if (!output[0]) {
+                printf("{\"ok\":false,\"error\":\"capture: "
+                       "output required\"}\n");
+                fflush(stdout);
+                continue;
+            }
+            uint64_t samplerate = (uint64_t)json_get_int(line,
+                                                        "samplerate", 0);
+            uint64_t depth      = (uint64_t)json_get_int(line, "depth", 0);
+            char channels[256];
+            json_get_str(line, "channels", channels, sizeof(channels));
+            int timeout_sec = (int)json_get_int(line, "timeout", 30);
+            double vth = json_get_double(line, "vth", 0.0);
+
+            struct capture_opts opts = {
+                .operation_mode  = (int)json_get_int(line,
+                                                     "operation_mode", -1),
+                .buffer_option   = (int)json_get_int(line,
+                                                     "buffer_option", -1),
+                .filter          = (int)json_get_int(line, "filter", -1),
+                .channel_mode    = (int)json_get_int(line,
+                                                     "channel_mode", -1),
+                .rle             = (int)json_get_int(line, "rle", -1),
+                .ext_clock       = (int)json_get_int(line, "ext_clock", -1),
+                .falling_edge    = (int)json_get_int(line,
+                                                     "falling_edge", -1),
+                .max_height      = NULL,
+                .trigger_channel = (int)json_get_int(line,
+                                                     "trigger_channel", -1),
+                .trigger_edge    = 'X',
+                .trigger_pos_pct = (int)json_get_int(line,
+                                                     "trigger_pos_pct", -1),
+            };
+            char max_height[32]; char trigger_edge_w[16];
+            json_get_str(line, "max_height", max_height, sizeof(max_height));
+            json_get_str(line, "trigger_edge",
+                         trigger_edge_w, sizeof(trigger_edge_w));
+            if (max_height[0]) opts.max_height = max_height;
+            opts.trigger_edge = parse_trigger_edge_word(trigger_edge_w);
+
+            cmd_capture(bind_index, output, samplerate, depth,
+                        channels[0] ? channels : NULL,
+                        timeout_sec, vth, &opts,
+                        firmware_dir, user_data_dir);
+            fflush(stdout);
+            continue;
+        }
+        printf("{\"ok\":false,\"error\":\"unknown method '%s'\"}\n",
+               method);
+        fflush(stdout);
+    }
+    return 0;
+}
+
 /* ---- main ------------------------------------------------------------- */
 
 static void usage(const char *prog)
@@ -742,6 +948,7 @@ int main(int argc, char **argv)
     uint64_t depth = 0;
     int timeout = 30;
     double vth_volts = 0.0;
+    int bind_index = -1;
     struct capture_opts opts = {
         .operation_mode = -1,
         .buffer_option  = -1,
@@ -778,6 +985,7 @@ int main(int argc, char **argv)
         {"trigger-channel", required_argument, 0, 1009},
         {"trigger-edge",    required_argument, 0, 1010},
         {"trigger-pos",     required_argument, 0, 1011},
+        {"bind-index",      required_argument, 0, 1012},
         {"firmware",     required_argument, 0, 'f'},
         {"user-data",    required_argument, 0, 'u'},
         {"protocol",     required_argument, 0, 'P'},
@@ -831,6 +1039,7 @@ int main(int argc, char **argv)
             break;
         }
         case 1011: opts.trigger_pos_pct = atoi(optarg); break;
+        case 1012: bind_index = atoi(optarg); break;
         case 'f': firmware   = optarg;       break;
         case 'u': user_data  = optarg;       break;
         case 'P': protocol   = optarg;       break;
@@ -851,6 +1060,10 @@ int main(int argc, char **argv)
 
     if (strcmp(cmd, "list-devices") == 0) {
         return cmd_list_devices(firmware, user_data);
+    } else if (strcmp(cmd, "daemon") == 0) {
+        int idx = bind_index >= 0 ? bind_index : index;
+        if (idx < 0) { emit_error("daemon: --bind-index required"); return 64; }
+        return cmd_daemon(idx, firmware, user_data);
     } else if (strcmp(cmd, "device-info") == 0) {
         return cmd_device_info(index, firmware, user_data);
     } else if (strcmp(cmd, "capture") == 0) {

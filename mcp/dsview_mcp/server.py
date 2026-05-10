@@ -275,6 +275,18 @@ def list_devices() -> dict[str, Any]:
     return {"devices": res.get("devices", [])}
 
 
+def _device_info_via_daemon(index: int) -> dict[str, Any] | None:
+    if not _daemon_eligible_index(index):
+        return None
+    try:
+        d = _daemon_pool.get(index)  # type: ignore[union-attr]
+        rsp = d.request("device_info")
+        rsp.pop("ok", None)
+        return rsp
+    except (HelperError, json.JSONDecodeError):
+        return None
+
+
 @mcp.tool()
 def device_info(index: int = -1, include_disabled: bool = False) -> dict[str, Any]:
     """Get info about a device (channels, current samplerate, depth).
@@ -290,8 +302,12 @@ def device_info(index: int = -1, include_disabled: bool = False) -> dict[str, An
         {"name": "DSLogic PLus", "samplerate": 1000000, "depth": 1000000,
          "channels": [{"index": 0, "name": "SDA", "enabled": true}, ...]}
     """
-    res = _run_helper(["device-info", "--index", str(index)], timeout=15)
-    res.pop("ok", None)
+    via_daemon = _device_info_via_daemon(index)
+    if via_daemon is not None:
+        res = via_daemon
+    else:
+        res = _run_helper(["device-info", "--index", str(index)], timeout=15)
+        res.pop("ok", None)
     if not include_disabled:
         res["channels"] = [c for c in res.get("channels", [])
                            if c.get("enabled")]
@@ -446,43 +462,72 @@ def capture(
     cap_id = uuid.uuid4().hex[:8]
     prefix = WORKDIR / f"cap-{cap_id}"
 
-    args = [
-        "capture",
-        "--index", str(index),
-        "--output", str(prefix),
-        "--samplerate", str(samplerate),
-        "--depth", str(depth),
-        "--timeout", str(timeout_sec),
-    ]
-    if channels:
-        args += ["--channels", ",".join(str(c) for c in channels)]
-    if vth is not None:
-        args += ["--vth", str(vth)]
-    if op_mode_i is not None:
-        args += ["--operation-mode", str(op_mode_i)]
-    if buf_opt_i is not None:
-        args += ["--buffer-option", str(buf_opt_i)]
-    if filter_i is not None:
-        args += ["--filter", str(filter_i)]
-    if channel_mode is not None:
-        args += ["--channel-mode", str(int(channel_mode))]
-    if rle is not None:
-        args += ["--rle", "1" if rle else "0"]
-    if ext_clock is not None:
-        args += ["--ext-clock", "1" if ext_clock else "0"]
-    if falling_edge_clock is not None:
-        args += ["--falling-edge", "1" if falling_edge_clock else "0"]
-    if max_height:
-        args += ["--max-height", max_height]
-    if trigger_channel is not None and trigger_channel >= 0:
-        args += ["--trigger-channel", str(int(trigger_channel))]
-    if trigger_edge:
-        args += ["--trigger-edge", str(trigger_edge)]
-    if trigger_pos_pct is not None:
-        args += ["--trigger-pos", str(int(trigger_pos_pct))]
-
     t0 = time.time()
-    _run_helper(args, timeout=timeout_sec + 30)
+    if _daemon_eligible_index(index):
+        # Route through the long-running daemon for this device.
+        params: dict[str, Any] = {
+            "output": str(prefix),
+            "samplerate": int(samplerate),
+            "depth": int(depth),
+            "timeout": int(timeout_sec),
+        }
+        if channels:
+            params["channels"] = ",".join(str(c) for c in channels)
+        if vth is not None:                params["vth"] = float(vth)
+        if op_mode_i is not None:          params["operation_mode"] = op_mode_i
+        if buf_opt_i is not None:          params["buffer_option"]  = buf_opt_i
+        if filter_i is not None:           params["filter"]         = filter_i
+        if channel_mode is not None:       params["channel_mode"]   = int(channel_mode)
+        if rle is not None:                params["rle"]            = 1 if rle else 0
+        if ext_clock is not None:          params["ext_clock"]      = 1 if ext_clock else 0
+        if falling_edge_clock is not None: params["falling_edge"]   = 1 if falling_edge_clock else 0
+        if max_height:                     params["max_height"]     = max_height
+        if trigger_channel is not None and trigger_channel >= 0:
+            params["trigger_channel"] = int(trigger_channel)
+        if trigger_edge:                   params["trigger_edge"]   = str(trigger_edge)
+        if trigger_pos_pct is not None:    params["trigger_pos_pct"] = int(trigger_pos_pct)
+        rsp = _daemon_pool.get(index).request(  # type: ignore[union-attr]
+            "capture", params, timeout=timeout_sec + 30,
+        )
+        if not rsp.get("ok"):
+            raise HelperError(rsp.get("error", "daemon capture failed"))
+    else:
+        args = [
+            "capture",
+            "--index", str(index),
+            "--output", str(prefix),
+            "--samplerate", str(samplerate),
+            "--depth", str(depth),
+            "--timeout", str(timeout_sec),
+        ]
+        if channels:
+            args += ["--channels", ",".join(str(c) for c in channels)]
+        if vth is not None:
+            args += ["--vth", str(vth)]
+        if op_mode_i is not None:
+            args += ["--operation-mode", str(op_mode_i)]
+        if buf_opt_i is not None:
+            args += ["--buffer-option", str(buf_opt_i)]
+        if filter_i is not None:
+            args += ["--filter", str(filter_i)]
+        if channel_mode is not None:
+            args += ["--channel-mode", str(int(channel_mode))]
+        if rle is not None:
+            args += ["--rle", "1" if rle else "0"]
+        if ext_clock is not None:
+            args += ["--ext-clock", "1" if ext_clock else "0"]
+        if falling_edge_clock is not None:
+            args += ["--falling-edge", "1" if falling_edge_clock else "0"]
+        if max_height:
+            args += ["--max-height", max_height]
+        if trigger_channel is not None and trigger_channel >= 0:
+            args += ["--trigger-channel", str(int(trigger_channel))]
+        if trigger_edge:
+            args += ["--trigger-edge", str(trigger_edge)]
+        if trigger_pos_pct is not None:
+            args += ["--trigger-pos", str(int(trigger_pos_pct))]
+
+        _run_helper(args, timeout=timeout_sec + 30)
     elapsed = time.time() - t0
 
     cap = _load_capture(cap_id)
@@ -879,8 +924,10 @@ def decode(
 # The gui_* tools degrade gracefully: if 7384 is closed they return a hint
 # explaining how to enable it.
 
+import atexit
 import socket as _socket
 import subprocess as _subprocess
+import threading
 
 _GUI_HOST = "127.0.0.1"
 _GUI_PORT = 7384
@@ -1130,6 +1177,151 @@ def gui_save_session(path: str | None = None) -> dict[str, Any]:
     p: dict[str, Any] = {}
     if path: p["path"] = path
     return _gui_invoke("save_session", p, timeout=60)
+
+
+# ---------------------------------------------------------------------------
+# Optional daemon pool — keep one helper subprocess per device alive so it
+# can hold the USB handle persistently. Avoids the spawn-on-call hotplug
+# enumeration race when 2+ DSLogic Plus units are attached.
+#
+# Off by default; set DSVIEW_USE_DAEMON_POOL=1 to enable. The pool spawns
+# lazily — first call to capture(index=N) on a USB-backed device boots a
+# daemon for N if none exists. Demo Device skips the pool (cheap to spawn).
+# ---------------------------------------------------------------------------
+
+
+class _DeviceDaemon:
+    """Long-running `dsview_helper daemon --bind-index N` subprocess."""
+
+    def __init__(self, bind_index: int) -> None:
+        cmd = [
+            str(HELPER), "daemon", "--bind-index", str(bind_index),
+            "--firmware", str(FIRMWARE_DIR),
+            "--user-data", str(USER_DATA_DIR),
+            "--decoders-dir", str(DECODERS_DIR),
+        ]
+        self.proc = _subprocess.Popen(
+            cmd,
+            stdin=_subprocess.PIPE,
+            stdout=_subprocess.PIPE,
+            stderr=_subprocess.DEVNULL,
+            text=True, bufsize=1,
+        )
+        ready_line = self.proc.stdout.readline()
+        if not ready_line:
+            raise HelperError(
+                f"daemon for index {bind_index} died before ready signal")
+        ready = json.loads(ready_line)
+        if not ready.get("ok"):
+            raise HelperError(
+                f"daemon bind index {bind_index} failed: {ready}")
+        self.bind_index   = bind_index
+        self.bound_name   = ready.get("name", "")
+        self.bound_handle = ready.get("handle", 0)
+        self._lock = threading.Lock()
+
+    def request(self, method: str,
+                params: dict[str, Any] | None = None,
+                timeout: float = 60.0) -> dict[str, Any]:
+        if self.proc.poll() is not None:
+            raise HelperError(f"daemon for index {self.bind_index} exited "
+                              f"(rc={self.proc.returncode})")
+        req: dict[str, Any] = {"method": method}
+        if params:
+            req.update(params)
+        # Compact separators — the daemon's lightweight JSON scanner
+        # matches `"key":` literal (no spaces).
+        line = json.dumps(req, separators=(",", ":")) + "\n"
+        with self._lock:
+            self.proc.stdin.write(line)
+            self.proc.stdin.flush()
+            response_line = self.proc.stdout.readline()
+        if not response_line:
+            raise HelperError(
+                f"daemon index {self.bind_index} closed stdout mid-request")
+        return json.loads(response_line.strip())
+
+    def close(self) -> None:
+        if self.proc.poll() is not None:
+            return
+        try:
+            with self._lock:
+                self.proc.stdin.write('{"method":"shutdown"}\n')
+                self.proc.stdin.flush()
+            self.proc.wait(timeout=2)
+        except Exception:
+            self.proc.kill()
+
+
+class _DaemonPool:
+    """Lazy per-index daemon registry."""
+
+    def __init__(self) -> None:
+        self._pool: dict[int, _DeviceDaemon] = {}
+        self._lock = threading.Lock()
+
+    def get(self, index: int) -> _DeviceDaemon:
+        with self._lock:
+            d = self._pool.get(index)
+            if d is None or d.proc.poll() is not None:
+                d = _DeviceDaemon(index)
+                self._pool[index] = d
+            return d
+
+    def shutdown(self) -> None:
+        with self._lock:
+            for d in self._pool.values():
+                d.close()
+            self._pool.clear()
+
+    def is_active(self) -> bool:
+        return bool(self._pool)
+
+
+_daemon_pool: _DaemonPool | None = None
+if os.environ.get("DSVIEW_USE_DAEMON_POOL", "0").lower() not in (
+        "0", "", "false", "off", "no"):
+    _daemon_pool = _DaemonPool()
+    atexit.register(_daemon_pool.shutdown)
+
+
+def _daemon_eligible_index(index: int) -> bool:
+    """Skip Demo Device (index 0 by convention; check name to be sure).
+    Demo is virtual and cheap to spawn; daemon-mode benefit is for USB
+    devices where we want to hold the handle across calls."""
+    if _daemon_pool is None or index < 0:
+        return False
+    if index == 0:
+        return False
+    return True
+
+
+@mcp.tool()
+def daemon_pool_status() -> dict[str, Any]:
+    """Inspect the optional helper daemon pool. Set
+    DSVIEW_USE_DAEMON_POOL=1 in the env that launches dsview-mcp to
+    enable.
+
+    Returns:
+        {enabled, daemons: [{index, name, handle, alive}], hint}
+    """
+    if _daemon_pool is None:
+        return {
+            "enabled": False,
+            "hint": ("Set DSVIEW_USE_DAEMON_POOL=1 in the dsview-mcp "
+                     "process env (then restart Claude Code) to spawn "
+                     "long-running per-device helpers, avoiding "
+                     "spawn-on-call hotplug races on multi-Plus rigs."),
+        }
+    out = []
+    for idx, d in _daemon_pool._pool.items():  # noqa: SLF001 — debug surface
+        out.append({
+            "index": idx,
+            "name": d.bound_name,
+            "handle": d.bound_handle,
+            "alive": d.proc.poll() is None,
+        })
+    return {"enabled": True, "daemons": out}
 
 
 @mcp.tool()
