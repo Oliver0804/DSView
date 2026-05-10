@@ -20,6 +20,7 @@
 
 #include "../sigsession.h"
 #include "../deviceagent.h"
+#include "../eventobject.h"
 #include "../mainwindow.h"
 #include "../storesession.h"
 #include "../toolbars/samplingbar.h"
@@ -633,6 +634,48 @@ QJsonObject McpServer::toolSaveSession(const QJsonObject &params,
     } else {
         if (err) *err = ss.error();
     }
+    return r;
+}
+
+/* set_channel_name({index: int, name: string}) — rename a logic
+ * channel so subsequent device_info / capture metadata / decoder
+ * auto-mapping see the user-friendly label. Mutates sr_channel::name
+ * directly and asks the GUI to redraw the trace label. */
+QJsonObject McpServer::toolSetChannelName(const QJsonObject &params,
+                                          QString *err)
+{
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    int idx = params.value("index").toInt(-1);
+    QString new_name = params.value("name").toString();
+    if (idx < 0) { if (err) *err = "params.index required"; return {}; }
+    if (new_name.isEmpty()) {
+        if (err) *err = "params.name required (non-empty string)";
+        return {};
+    }
+
+    sr_channel *target = nullptr;
+    GSList *chs = ds_get_actived_device_channels();
+    for (GSList *l = chs; l; l = l->next) {
+        sr_channel *c = (sr_channel *)l->data;
+        if (c && c->index == idx) { target = c; break; }
+    }
+    if (!target) {
+        if (err) *err = QStringLiteral("channel index %1 not found").arg(idx);
+        return {};
+    }
+
+    if (target->name) g_free(target->name);
+    target->name = g_strdup(new_name.toUtf8().constData());
+
+    /* Tell views to repaint with the new label. SigSession::signals_changed
+     * is non-public, so go through MainWindow's EventObject instead. */
+    if (_main_window && _main_window->getEvent())
+        emit _main_window->getEvent()->signals_changed();
+
+    QJsonObject r;
+    r["ok"]    = true;
+    r["index"] = idx;
+    r["name"]  = new_name;
     return r;
 }
 

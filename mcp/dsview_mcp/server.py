@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -463,6 +464,7 @@ def capture(
     prefix = WORKDIR / f"cap-{cap_id}"
 
     t0 = time.time()
+    daemon_attempted = False
     if _daemon_eligible_index(index):
         # Route through the long-running daemon for this device.
         params: dict[str, Any] = {
@@ -486,12 +488,24 @@ def capture(
             params["trigger_channel"] = int(trigger_channel)
         if trigger_edge:                   params["trigger_edge"]   = str(trigger_edge)
         if trigger_pos_pct is not None:    params["trigger_pos_pct"] = int(trigger_pos_pct)
-        rsp = _daemon_pool.get(index).request(  # type: ignore[union-attr]
-            "capture", params, timeout=timeout_sec + 30,
-        )
-        if not rsp.get("ok"):
-            raise HelperError(rsp.get("error", "daemon capture failed"))
-    else:
+
+        daemon_attempted = True
+        try:
+            rsp = _daemon_pool.get(index).request(  # type: ignore[union-attr]
+                "capture", params, timeout=timeout_sec + 30,
+            )
+            if not rsp.get("ok"):
+                raise HelperError(rsp.get("error", "daemon capture failed"))
+        except HelperError as daemon_err:
+            # Daemon spawn or capture failed (typically a hotplug race
+            # at bind time). Fall back to the spawn-on-call path which
+            # has its own retry loop and tends to clear the same race
+            # by waiting an extra settle cycle.
+            print(f"[dsview-mcp] daemon path failed for index {index}: "
+                  f"{daemon_err}; falling back to spawn-on-call",
+                  file=sys.stderr)
+            daemon_attempted = False
+    if not daemon_attempted:
         args = [
             "capture",
             "--index", str(index),
@@ -779,6 +793,11 @@ def _summarize_annotations(anns: list[dict[str, Any]]) -> dict[str, Any]:
     Groups same-label data annotations into hex byte streams (for SPI/I2C/UART
     style protocols) and keeps non-bit-level events as compact triplets so the
     LLM can still see Start / Stop / framing.
+
+    Long runs of identical framing events (e.g. an idle I²C bus that
+    keeps emitting `start`→`stop` pairs) are folded into a single
+    `{l: "...", count: N, s_first, s_last}` entry — preserves the
+    information without burning tokens on N repeats.
     """
     streams: dict[str, list[str]] = {}
     events: list[dict[str, Any]] = []
@@ -790,13 +809,29 @@ def _summarize_annotations(anns: list[dict[str, Any]]) -> dict[str, Any]:
         if hex_v:
             streams.setdefault(label, []).append(hex_v)
             continue
-        # Compact event form: [start_sample, label, text_or_empty]
         text = a.get("text") or []
         events.append({
             "s": a["start"],
             "l": label,
             "t": text[0] if text else "",
         })
+
+    # Run-length-encode adjacent events that share label + text. Cuts the
+    # 'idle bus' case from thousands of items down to a couple of entries.
+    if events:
+        collapsed: list[dict[str, Any]] = []
+        for ev in events:
+            if (collapsed
+                    and collapsed[-1]["l"] == ev["l"]
+                    and collapsed[-1]["t"] == ev["t"]):
+                last = collapsed[-1]
+                last["count"]   = last.get("count", 1) + 1
+                last["s_last"]  = ev["s"]
+                last.setdefault("s_first", last["s"])
+            else:
+                collapsed.append(dict(ev))
+        events = collapsed
+
     out: dict[str, Any] = {}
     if streams:
         out["streams"] = {k: " ".join(v) for k, v in streams.items()}
@@ -1134,6 +1169,27 @@ def gui_set_config(
     if not p:
         return {"ok": True, "applied": {}, "hint": "no fields specified"}
     return _gui_invoke("set_config", p)
+
+
+@mcp.tool()
+def gui_set_channel_name(index: int, name: str) -> dict[str, Any]:
+    """Rename a logic channel in the running GUI. After this call,
+    `device_info` / `capture` metadata / `suggest_channel_map` will see
+    the new name, so an LLM can label channels (SDA / SCL / CLK / MOSI
+    / MISO / RXTX / CAN…) before running auto_capture_and_decode.
+
+    Args:
+        index: channel index (0..N-1) on the GUI's active device.
+        name:  new label.
+
+    Example:
+        >>> gui_set_channel_name(index=0, name="SDA")
+        {"ok": true, "index": 0, "name": "SDA"}
+        >>> gui_set_channel_name(index=1, name="SCL")
+        >>> # now auto_capture_and_decode("1:i2c") can map automatically
+    """
+    return _gui_invoke("set_channel_name",
+                       {"index": int(index), "name": str(name)})
 
 
 @mcp.tool()

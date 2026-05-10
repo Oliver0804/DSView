@@ -66,6 +66,7 @@
 #include "toolbars/trigbar.h"
 #include "toolbars/filebar.h"
 #include "toolbars/logobar.h"
+#include "toolbars/mcpbar.h"
 #include "toolbars/titlebar.h"
 
 #include "dock/triggerdock.h"
@@ -182,6 +183,9 @@ namespace pv
         _logo_bar = new toolbars::LogoBar(_session, this);
         _logo_bar->setObjectName("logo_bar");
 
+        _mcp_bar = new toolbars::McpBar(_session, this);
+        _mcp_bar->setObjectName("mcp_bar");
+
         // trigger dock
         _trigger_dock = new QDockWidget(L_S(STR_PAGE_DLG, S_ID(IDS_DLG_TRIGGER_DOCK_TITLE), "Trigger Setting..."), this);
         _trigger_dock->setObjectName("trigger_dock");
@@ -208,6 +212,7 @@ namespace pv
         addToolBar(_sampling_bar);
         addToolBar(_trig_bar);
         addToolBar(_file_bar);
+        addToolBar(_mcp_bar);
         addToolBar(_logo_bar);
 
         // Setup the dockWidget
@@ -303,10 +308,13 @@ namespace pv
 
         // logobar
         connect(_logo_bar, SIGNAL(sig_open_doc()), this, SLOT(on_open_doc()));
-        connect(_logo_bar, SIGNAL(sig_mcp_toggle(bool)), this, SLOT(on_mcp_toggle(bool)));
-        connect(_logo_bar, SIGNAL(sig_mcp_show_log()), this, SLOT(on_mcp_show_log()));
+
+        // MCP entries moved out of LogoBar into the dedicated McpBar
+        // (sits between FileBar and LogoBar so it's a peer of Display/File).
+        connect(_mcp_bar, SIGNAL(sig_mcp_toggle(bool)), this, SLOT(on_mcp_toggle(bool)));
+        connect(_mcp_bar, SIGNAL(sig_mcp_show_log()), this, SLOT(on_mcp_show_log()));
         if (_mcp_server)
-            _logo_bar->set_mcp_listening(_mcp_server->isListening());
+            _mcp_bar->set_mcp_listening(_mcp_server->isListening());
 
         connect(_protocol_widget, SIGNAL(protocol_updated()), this, SLOT(on_signals_changed()));
 
@@ -1518,15 +1526,15 @@ namespace pv
                 && !_mcp_server->start(MCP_DEFAULT_PORT)) {
                 dsv_warn("MCP server failed to start (port %u in use?)",
                          MCP_DEFAULT_PORT);
-                if (_logo_bar)
-                    _logo_bar->set_mcp_listening(false);
+                if (_mcp_bar)
+                    _mcp_bar->set_mcp_listening(false);
                 return;
             }
         } else {
             _mcp_server->stop();
         }
-        if (_logo_bar)
-            _logo_bar->set_mcp_listening(_mcp_server->isListening());
+        if (_mcp_bar)
+            _mcp_bar->set_mcp_listening(_mcp_server->isListening());
     }
 
     void MainWindow::on_mcp_show_log()

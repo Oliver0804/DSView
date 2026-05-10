@@ -59,6 +59,7 @@ class TrigBar;
 class FileBar;
 class LogoBar;
 class TitleBar;
+class McpBar;
 }
 
 namespace dock{
@@ -230,6 +231,7 @@ private:
     toolbars::TrigBar       *_trig_bar;
     toolbars::FileBar       *_file_bar;
     toolbars::LogoBar       *_logo_bar; //help button, on top right
+    toolbars::McpBar        *_mcp_bar = nullptr; // MCP toggle + Logs (between FileBar and LogoBar)
     toolbars::TitleBar      *_title_bar;
 
 

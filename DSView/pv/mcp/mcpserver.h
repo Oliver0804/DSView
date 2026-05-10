@@ -96,6 +96,7 @@ private:
     QJsonObject toolGetState(const QJsonObject &params, QString *err);
     QJsonObject toolSaveSession(const QJsonObject &params, QString *err);
     QJsonObject toolLoadSession(const QJsonObject &params, QString *err);
+    QJsonObject toolSetChannelName(const QJsonObject &params, QString *err);
 
 private:
     QTcpServer            _server;

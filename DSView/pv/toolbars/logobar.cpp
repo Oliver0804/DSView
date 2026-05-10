@@ -94,11 +94,11 @@ LogoBar::LogoBar(SigSession *session, QWidget *parent) :
     _update = new QAction(this);
     _log = new QAction(this);
 
-    _mcp_enable = new QAction(this);
-    _mcp_enable->setCheckable(true);
-    _mcp_enable->setChecked(false);
-
-    _mcp_log = new QAction(this);
+    /* MCP entries moved out to toolbars::McpBar — keep these private
+     * fields nulled so destructors / future references stay safe even
+     * after the menu was simplified back to the upstream layout. */
+    _mcp_enable = nullptr;
+    _mcp_log    = nullptr;
 
     _menu = new QMenu(this);
     _menu->addMenu(_language);
@@ -107,9 +107,6 @@ LogoBar::LogoBar(SigSession *session, QWidget *parent) :
     _menu->addAction(_issue);
     _menu->addAction(_update);
     _menu->addAction(_log);
-    _menu->addSeparator();
-    _menu->addAction(_mcp_enable);
-    _menu->addAction(_mcp_log);
     _logo_button.setMenu(_menu);
 
     _logo_button.setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
@@ -130,8 +127,6 @@ LogoBar::LogoBar(SigSession *session, QWidget *parent) :
     connect(_issue, SIGNAL(triggered()), this, SLOT(on_actionIssue_triggered()));
     connect(_update, SIGNAL(triggered()), this, SLOT(on_action_update()));
     connect(_log, SIGNAL(triggered()), this, SLOT(on_action_setting_log()));
-    connect(_mcp_enable, SIGNAL(toggled(bool)), this, SLOT(on_mcp_toggle(bool)));
-    connect(_mcp_log, SIGNAL(triggered()), this, SLOT(on_mcp_log_triggered()));
 
     ADD_UI(this);
 }
@@ -153,8 +148,6 @@ void LogoBar::retranslateUi()
     _issue->setText(L_S(STR_PAGE_TOOLBAR, S_ID(IDS_TOOLBAR_HELP_BUG), "&Bug Report"));
     _update->setText(L_S(STR_PAGE_TOOLBAR, S_ID(IDS_TOOLBAR_HELP_UPDATE), "&Update"));
     _log->setText(L_S(STR_PAGE_TOOLBAR, S_ID(IDS_TOOLBAR_HELP_LOG), "L&og Options"));
-    _mcp_enable->setText(tr("MCP Server (port 7384)"));
-    _mcp_log->setText(tr("MCP Logs..."));
 
     AppConfig &app = AppConfig::Instance(); 
     if (app.frameOptions.language == LAN_CN)
@@ -355,22 +348,9 @@ void LogoBar::on_clear_log_file()
     }  
 }
 
-void LogoBar::on_mcp_toggle(bool checked)
-{
-    emit sig_mcp_toggle(checked);
-}
-
-void LogoBar::on_mcp_log_triggered()
-{
-    emit sig_mcp_show_log();
-}
-
-void LogoBar::set_mcp_listening(bool on)
-{
-    if (!_mcp_enable) return;
-    QSignalBlocker block(_mcp_enable);
-    _mcp_enable->setChecked(on);
-}
+void LogoBar::on_mcp_toggle(bool checked) { Q_UNUSED(checked); }
+void LogoBar::on_mcp_log_triggered() {}
+void LogoBar::set_mcp_listening(bool on)  { Q_UNUSED(on); }
 
 void LogoBar::UpdateLanguage()
 {
