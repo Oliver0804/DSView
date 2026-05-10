@@ -365,8 +365,42 @@ static int cmd_capture(int index, const char *output_prefix,
     if (rc != SR_OK) { emit_error("ds_lib_init failed"); return 1; }
 
     usleep(300 * 1000);
+
+    /* Snapshot the device list *before* activation so we can verify the
+     * activate request actually landed on the slot we asked for. USB
+     * exclusivity races can leave libsigrok with a different active
+     * device than expected (open fails internally, lib falls back). */
+    char expected_name[150] = {0};
+    {
+        ds_reload_device_list();
+        struct ds_device_base_info *arr = NULL;
+        int count = 0;
+        if (ds_get_device_list(&arr, &count) == SR_OK && arr && index >= 0
+                && index < count) {
+            strncpy(expected_name, arr[index].name,
+                    sizeof(expected_name) - 1);
+        }
+        if (arr) g_free(arr);
+    }
+
     if ((rc = activate_index(index)) != SR_OK) {
         emit_error("activate device %d failed: %s", index, sr_error_str(rc));
+        return 1;
+    }
+
+    /* Verify what we actually got (kept in scope for metadata below). */
+    static char actual_name[150];
+    actual_name[0] = '\0';
+    {
+        struct ds_device_full_info dinfo; memset(&dinfo, 0, sizeof(dinfo));
+        ds_get_actived_device_info(&dinfo);
+        strncpy(actual_name, dinfo.name, sizeof(actual_name) - 1);
+    }
+    if (expected_name[0] && strcmp(expected_name, actual_name) != 0) {
+        emit_error("active-device mismatch: requested index=%d (%s) but "
+                   "lib activated %s — likely USB exclusion (another "
+                   "process is holding the device)",
+                   index, expected_name, actual_name);
         return 1;
     }
 
@@ -587,6 +621,7 @@ static int cmd_capture(int index, const char *output_prefix,
         "\"layout\":\"%s\","
         "\"enabled_channels\":%d,"
         "\"enabled_indices\":\"%s\","
+        "\"active_device_name\":\"%s\","
         "\"atomic_samples\":64,"
         "\"atomic_bytes_per_channel\":8,"
         "\"bytes\":%" PRIu64 ","
@@ -597,6 +632,7 @@ static int cmd_capture(int index, const char *output_prefix,
         (g.logic_format == LA_SPLIT_DATA ? "split" : "cross"),
         layout, enabled_logic,
         enabled_csv->str,
+        actual_name,
         g.bytes_written);
     g_string_free(enabled_csv, TRUE);
     int first = 1;

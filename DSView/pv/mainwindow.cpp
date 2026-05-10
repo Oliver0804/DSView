@@ -346,9 +346,45 @@ namespace pv
         if (tmp_file != ""){
             on_load_file(tmp_file);
             tmp_file = "";
+            return;
         }
-        else{
-            _session->set_default_device();
+
+        _session->set_default_device();
+
+        /* DSVIEW_DEFAULT_DEVICE = name substring (e.g. "Demo") makes the
+         * GUI auto-switch to a non-default device on startup, so a
+         * companion stdio MCP / helper can keep the USD device for
+         * itself. Empty / unset → upstream behaviour (DSLogic preferred). */
+        QByteArray pref = qgetenv("DSVIEW_DEFAULT_DEVICE");
+        if (pref.isEmpty()) return;
+        QString want = QString::fromUtf8(pref).trimmed().toLower();
+        if (want.isEmpty()) return;
+
+        struct ds_device_base_info *arr = nullptr;
+        int count = 0;
+        ds_reload_device_list();
+        if (ds_get_device_list(&arr, &count) != SR_OK || !arr) return;
+
+        ds_device_handle wanted = NULL_HANDLE;
+        for (int i = 0; i < count; i++) {
+            QString name = QString::fromUtf8(arr[i].name).toLower();
+            if (name.contains(want)) { wanted = arr[i].handle; break; }
+        }
+        g_free(arr);
+
+        if (wanted != NULL_HANDLE
+            && _session->get_device()
+            && _session->get_device()->handle() != wanted) {
+            if (_session->set_device(wanted)) {
+                dsv_info("DSVIEW_DEFAULT_DEVICE='%s' → switched to %s",
+                         pref.constData(),
+                         _session->get_device()->name().toUtf8().constData());
+                if (_sampling_bar) {
+                    _sampling_bar->update_device_list();
+                    _sampling_bar->update_sample_rate_list();
+                    _sampling_bar->update_view_status();
+                }
+            }
         }
     }
 
