@@ -97,6 +97,7 @@
 #include "log.h"
 #include "sigsession.h"
 #include "deviceagent.h"
+#include "mcp/mcpserver.h"
 #include <stdlib.h>
 #include "ZipMaker.h"
 #include "ui/langresource.h"
@@ -141,6 +142,12 @@ namespace pv
         _last_key_press_time = high_resolution_clock::now();
 
         update_title_bar_text();
+
+        /* Embedded MCP server — listens on 127.0.0.1 so Claude Code can
+         * drive DSView from outside the GUI. */
+        _mcp_server = new pv::mcp::McpServer(_session, this, this);
+        if (!_mcp_server->start(7384))
+            dsv_warn("MCP server failed to start (port 7384 in use?)");
     }
 
     void MainWindow::setup_ui()

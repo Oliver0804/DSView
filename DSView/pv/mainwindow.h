@@ -72,7 +72,11 @@ class SearchDock;
 namespace view {
 class View;
 }
- 
+
+namespace mcp {
+class McpServer;
+}
+
 //The mainwindow,referenced by MainFrame
 //TODO: create graph view,toolbar,and show device list
 class MainWindow : 
@@ -94,6 +98,9 @@ public:
     explicit MainWindow(toolbars::TitleBar *title_bar, QWidget *parent = 0);
 
     void openDoc();
+
+    inline EventObject* getEvent() { return &_event; }
+    inline SigSession*  getSession() { return _session; }
 
 public slots: 
     void switchTheme(QString style);
@@ -231,8 +238,9 @@ private:
 
     QTranslator     _qtTrans;
     QTranslator     _myTrans;
-    EventObject     _event; 
+    EventObject     _event;
     SigSession      *_session;
+    pv::mcp::McpServer *_mcp_server = nullptr;
     DeviceAgent     *_device_agent;
     bool            _is_auto_switch_device;
     high_resolution_clock::time_point _last_key_press_time;

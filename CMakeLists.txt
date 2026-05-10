@@ -185,12 +185,13 @@ if(Qt5Core_FOUND)
 	#find_package(Qt5WinExtras REQUIRED)
 	find_package(Qt5Widgets REQUIRED)
 	find_package(Qt5Gui REQUIRED)
+	find_package(Qt5Network REQUIRED)
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${Qt5Widgets_EXECUTABLE_COMPILE_FLAGS}")
 	#set(QT_INCLUDE_DIRS ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS} ${Qt5WinExtras_INCLUDE_DIRS})
 	#set(QT_LIBRARIES Qt5::Gui Qt5::Widgets Qt5::WinExtras)
-	set(QT_INCLUDE_DIRS ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS})
-	set(QT_LIBRARIES Qt5::Gui Qt5::Widgets)
-	add_definitions(${Qt5Gui_DEFINITIONS} ${Qt5Widgets_DEFINITIONS})
+	set(QT_INCLUDE_DIRS ${Qt5Gui_INCLUDE_DIRS} ${Qt5Widgets_INCLUDE_DIRS} ${Qt5Network_INCLUDE_DIRS})
+	set(QT_LIBRARIES Qt5::Gui Qt5::Widgets Qt5::Network)
+	add_definitions(${Qt5Gui_DEFINITIONS} ${Qt5Widgets_DEFINITIONS} ${Qt5Network_DEFINITIONS})
 else()
 	find_package(Qt6Core QUIET)
 endif()
@@ -200,10 +201,11 @@ if(Qt6Core_FOUND)
 	message(STATUS "	 includes:" ${Qt6Core_INCLUDE_DIRS})
 	find_package(Qt6Widgets REQUIRED)
 	find_package(Qt6Gui REQUIRED)
+	find_package(Qt6Network REQUIRED)
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${Qt6Widgets_EXECUTABLE_COMPILE_FLAGS}")
-	set(QT_INCLUDE_DIRS ${Qt6Gui_INCLUDE_DIRS} ${Qt6Widgets_INCLUDE_DIRS})
-	set(QT_LIBRARIES Qt6::Gui Qt6::Widgets)
-	add_definitions(${Qt6Gui_DEFINITIONS} ${Qt6Widgets_DEFINITIONS})
+	set(QT_INCLUDE_DIRS ${Qt6Gui_INCLUDE_DIRS} ${Qt6Widgets_INCLUDE_DIRS} ${Qt6Network_INCLUDE_DIRS})
+	set(QT_LIBRARIES Qt6::Gui Qt6::Widgets Qt6::Network)
+	add_definitions(${Qt6Gui_DEFINITIONS} ${Qt6Widgets_DEFINITIONS} ${Qt6Network_DEFINITIONS})
 endif()
 
 if(NOT Qt5Core_FOUND AND NOT Qt6Core_FOUND)
@@ -241,6 +243,8 @@ set(DSView_SOURCES
     DSView/pv/log.cpp
     DSView/pv/sigsession.cpp
     DSView/pv/mainwindow.cpp
+    DSView/pv/mcp/mcpserver.cpp
+    DSView/pv/mcp/mcptools.cpp
     DSView/pv/data/snapshot.cpp
     DSView/pv/data/signaldata.cpp
     DSView/pv/data/logicsnapshot.cpp
@@ -361,6 +365,7 @@ set(DSView_HEADERS
     DSView/pv/log.h
     DSView/pv/sigsession.h
     DSView/pv/mainwindow.h
+    DSView/pv/mcp/mcpserver.h
     DSView/pv/dialogs/deviceoptions.h
     DSView/pv/prop/property.h
     DSView/pv/prop/int.h
