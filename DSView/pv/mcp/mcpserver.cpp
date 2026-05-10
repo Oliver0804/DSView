@@ -152,6 +152,22 @@ void McpServer::handleLine(QTcpSocket *sock, const QByteArray &line)
         result = toolDecode(par, &err);
     } else if (method == "screenshot") {
         result = toolScreenshot(par, &err);
+    } else if (method == "run_start") {
+        result = toolRunStart(par, &err);
+    } else if (method == "run_stop") {
+        result = toolRunStop(par, &err);
+    } else if (method == "instant_shot") {
+        result = toolInstantShot(par, &err);
+    } else if (method == "set_active_device") {
+        result = toolSetActiveDevice(par, &err);
+    } else if (method == "set_config") {
+        result = toolSetConfig(par, &err);
+    } else if (method == "set_channel") {
+        result = toolSetChannel(par, &err);
+    } else if (method == "set_collect_mode") {
+        result = toolSetCollectMode(par, &err);
+    } else if (method == "get_state") {
+        result = toolGetState(par, &err);
     } else {
         writeError(sock, id, -32601,
                    QStringLiteral("Method not found: %1").arg(method));

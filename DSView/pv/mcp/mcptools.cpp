@@ -254,6 +254,64 @@ QJsonObject McpServer::toolDecode(const QJsonObject &params, QString *err)
     return QJsonObject();
 }
 
+/* ---- shared helpers for set_config / capture-with-options ----------- */
+
+namespace {
+
+struct ConfigKeyDesc {
+    const char *name;
+    int         key;
+    char        type;   /* 'd'=double, 'i'=int16, 'b'=bool, 's'=string,
+                         * 'u'=uint64 */
+};
+
+static const ConfigKeyDesc CONFIG_KEYS[] = {
+    {"vth",                SR_CONF_VTH,             'd'},
+    {"operation_mode",     SR_CONF_OPERATION_MODE,  'i'},
+    {"buffer_option",      SR_CONF_BUFFER_OPTIONS,  'i'},
+    {"filter",             SR_CONF_FILTER,          'i'},
+    {"channel_mode",       SR_CONF_CHANNEL_MODE,    'i'},
+    {"rle",                SR_CONF_RLE,             'b'},
+    {"ext_clock",          SR_CONF_CLOCK_TYPE,      'b'},
+    {"falling_edge_clock", SR_CONF_CLOCK_EDGE,      'b'},
+    {"max_height",         SR_CONF_MAX_HEIGHT,      's'},
+    {"samplerate",         SR_CONF_SAMPLERATE,      'u'},
+    {"depth",              SR_CONF_LIMIT_SAMPLES,   'u'},
+};
+
+static const ConfigKeyDesc *config_lookup(const QString &name) {
+    for (const auto &d : CONFIG_KEYS)
+        if (name == QLatin1String(d.name)) return &d;
+    return nullptr;
+}
+
+/* Apply one (key, value) pair against the active device. Returns "" on
+ * success, otherwise an error message. */
+static QString apply_config(const QString &name, const QJsonValue &val)
+{
+    const ConfigKeyDesc *d = config_lookup(name);
+    if (!d) return QStringLiteral("unknown key: %1").arg(name);
+
+    GVariant *gv = nullptr;
+    switch (d->type) {
+    case 'd': gv = g_variant_new_double(val.toDouble()); break;
+    case 'i': gv = g_variant_new_int16((int16_t)val.toInt()); break;
+    case 'u': gv = g_variant_new_uint64(
+                  (uint64_t)val.toVariant().toLongLong()); break;
+    case 'b': gv = g_variant_new_boolean(val.toBool() ? TRUE : FALSE); break;
+    case 's': gv = g_variant_new_string(val.toString().toUtf8().constData());
+              break;
+    default: return QStringLiteral("internal: bad type for %1").arg(name);
+    }
+    int rc = ds_set_actived_device_config(NULL, NULL, d->key, gv);
+    if (rc != SR_OK)
+        return QStringLiteral("ds_set_actived_device_config(%1) -> %2")
+            .arg(name).arg(sr_error_str(rc));
+    return QString();
+}
+
+} // anonymous
+
 /* Grab the DSView main window and write it as PNG to a path the LLM can
  * read with its file/Image tooling. Returning the bytes directly would
  * blow up the JSON-RPC channel (a 1920×1170 PNG is ~400KB / ~530KB
@@ -298,6 +356,146 @@ QJsonObject McpServer::toolScreenshot(const QJsonObject &params, QString *err)
     r["width"]  = pix.width();
     r["height"] = pix.height();
     r["bytes"]  = (qint64)fi.size();
+    return r;
+}
+
+/* ---- toolbar buttons ------------------------------------------------ */
+
+QJsonObject McpServer::toolRunStart(const QJsonObject &params, QString *err)
+{
+    Q_UNUSED(params);
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    if (_session->is_working()) {
+        if (err) *err = "already capturing";
+        return {};
+    }
+    if (!_session->start_capture(false)) {
+        if (err) *err = "start_capture(false) failed";
+        return {};
+    }
+    QJsonObject r; r["ok"] = true; r["action"] = "run_start"; return r;
+}
+
+QJsonObject McpServer::toolRunStop(const QJsonObject &params, QString *err)
+{
+    Q_UNUSED(params);
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    if (!_session->stop_capture()) {
+        if (err) *err = "stop_capture() failed";
+        return {};
+    }
+    QJsonObject r; r["ok"] = true; r["action"] = "run_stop"; return r;
+}
+
+QJsonObject McpServer::toolInstantShot(const QJsonObject &params, QString *err)
+{
+    Q_UNUSED(params);
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    if (_session->is_working()) {
+        if (err) *err = "already capturing";
+        return {};
+    }
+    if (!_session->start_capture(true)) {
+        if (err) *err = "start_capture(true) failed";
+        return {};
+    }
+    QJsonObject r; r["ok"] = true; r["action"] = "instant_shot"; return r;
+}
+
+QJsonObject McpServer::toolSetActiveDevice(const QJsonObject &params,
+                                           QString *err)
+{
+    int idx = params.value("index").toInt(-1);
+    if (idx < 0) { if (err) *err = "params.index required"; return {}; }
+    int rc = ds_active_device_by_index(idx);
+    if (rc != SR_OK) {
+        if (err) *err = QStringLiteral("ds_active_device_by_index(%1) -> %2")
+            .arg(idx).arg(sr_error_str(rc));
+        return {};
+    }
+    QJsonObject r; r["ok"] = true; r["index"] = idx;
+    if (_session && _session->get_device())
+        r["name"] = _session->get_device()->name();
+    return r;
+}
+
+/* set_config({key: value, key: value, ...}) — sets one or more device
+ * options in a single call. Reports per-key results. */
+QJsonObject McpServer::toolSetConfig(const QJsonObject &params, QString *err)
+{
+    Q_UNUSED(err);
+    QJsonObject applied, errors;
+    for (auto it = params.constBegin(); it != params.constEnd(); ++it) {
+        QString e = apply_config(it.key(), it.value());
+        if (e.isEmpty()) applied[it.key()] = it.value();
+        else            errors[it.key()] = e;
+    }
+    QJsonObject r;
+    r["applied"] = applied;
+    if (!errors.isEmpty()) r["errors"] = errors;
+    r["ok"] = errors.isEmpty();
+    return r;
+}
+
+QJsonObject McpServer::toolSetChannel(const QJsonObject &params, QString *err)
+{
+    /* Two shapes:
+     *   {index: int, enabled: bool}            — single channel
+     *   {channels: {"0": true, "1": false...}} — batch */
+    QJsonObject applied;
+    if (params.contains("index")) {
+        int  idx = params.value("index").toInt(-1);
+        bool en  = params.value("enabled").toBool(true);
+        if (idx < 0) { if (err) *err = "params.index required"; return {}; }
+        ds_enable_device_channel_index(idx, en ? TRUE : FALSE);
+        applied[QString::number(idx)] = en;
+    }
+    QJsonObject batch = params.value("channels").toObject();
+    for (auto it = batch.constBegin(); it != batch.constEnd(); ++it) {
+        bool en = it.value().toBool(true);
+        ds_enable_device_channel_index(it.key().toInt(), en ? TRUE : FALSE);
+        applied[it.key()] = en;
+    }
+    QJsonObject r; r["ok"] = true; r["channels"] = applied; return r;
+}
+
+QJsonObject McpServer::toolSetCollectMode(const QJsonObject &params,
+                                          QString *err)
+{
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    QString m = params.value("mode").toString().toLower();
+    DEVICE_COLLECT_MODE cm;
+    if (m == "single")        cm = COLLECT_SINGLE;
+    else if (m == "repeat")   cm = COLLECT_REPEAT;
+    else if (m == "loop")     cm = COLLECT_LOOP;
+    else { if (err) *err = "mode must be single|repeat|loop"; return {}; }
+    _session->set_collect_mode(cm);
+    QJsonObject r; r["ok"] = true; r["mode"] = m; return r;
+}
+
+QJsonObject McpServer::toolGetState(const QJsonObject &params, QString *err)
+{
+    Q_UNUSED(params); Q_UNUSED(err);
+    QJsonObject r;
+    if (!_session) { r["ok"] = false; r["reason"] = "no session"; return r; }
+
+    DeviceAgent *agent = _session->get_device();
+    if (agent && agent->handle() != NULL_HANDLE) {
+        QJsonObject d;
+        d["name"]       = agent->name();
+        d["mode"]       = operation_mode_name(agent->get_work_mode());
+        d["samplerate"] = (qint64)agent->get_sample_rate();
+        d["depth"]      = (qint64)agent->get_sample_limit();
+        r["device"] = d;
+    }
+    r["working"]      = _session->is_working();
+    r["instant"]      = _session->is_instant();
+    r["collect_mode"] = _session->is_loop_mode()    ? "loop"
+                       : _session->is_repeat_mode() ? "repeat"
+                       : "single";
+    r["mcp_listening"] = _server.isListening();
+    r["mcp_port"]      = _server.serverPort();
+    r["ok"] = true;
     return r;
 }
 

@@ -84,6 +84,17 @@ private:
     QJsonObject toolDecode(const QJsonObject &params, QString *err);
     QJsonObject toolScreenshot(const QJsonObject &params, QString *err);
 
+    /* GUI control surface — equivalent to clicking buttons / dropdowns
+     * on the main toolbar. All sync; do not block on a frame. */
+    QJsonObject toolRunStart(const QJsonObject &params, QString *err);
+    QJsonObject toolRunStop(const QJsonObject &params, QString *err);
+    QJsonObject toolInstantShot(const QJsonObject &params, QString *err);
+    QJsonObject toolSetActiveDevice(const QJsonObject &params, QString *err);
+    QJsonObject toolSetConfig(const QJsonObject &params, QString *err);
+    QJsonObject toolSetChannel(const QJsonObject &params, QString *err);
+    QJsonObject toolSetCollectMode(const QJsonObject &params, QString *err);
+    QJsonObject toolGetState(const QJsonObject &params, QString *err);
+
 private:
     QTcpServer            _server;
     SigSession           *_session;
