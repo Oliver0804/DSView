@@ -955,9 +955,37 @@ def gui_run_stop() -> dict[str, Any]:
 
 
 @mcp.tool()
-def gui_instant_shot() -> dict[str, Any]:
-    """Press the toolbar 'Instant' button — single-shot quick capture."""
-    return _gui_invoke("instant_shot")
+def gui_instant_shot(auto_screenshot: bool = False,
+                     screenshot_path: str | None = None,
+                     wait_seconds: float = 2.0) -> dict[str, Any]:
+    """Press the toolbar 'Instant' button — single-shot quick capture.
+
+    Args:
+        auto_screenshot: capture a PNG of the GUI after the shot
+            settles. Saves the LLM one round-trip when it's about to
+            show the user a result anyway.
+        screenshot_path: where to write the PNG (default
+            /tmp/dsv_after_instant_<ts>.png). Only used when
+            auto_screenshot=True.
+        wait_seconds: how long to wait for the capture to render
+            before grabbing the screenshot.
+
+    Example:
+        >>> gui_instant_shot(auto_screenshot=True)
+        {"ok": true, "action": "instant_shot",
+         "screenshot": {"path": "/tmp/dsv_after_instant_1700.png",
+                        "width": 1280, "height": 800, "bytes": 92103}}
+    """
+    res = _gui_invoke("instant_shot")
+    if not auto_screenshot or not res.get("ok"):
+        return res
+    time.sleep(max(0.1, wait_seconds))
+    path = screenshot_path or (f"/tmp/dsv_after_instant_"
+                               f"{int(time.time()*1000)}.png")
+    shot = _gui_invoke("screenshot",
+                       {"path": path, "max_width": 1280}, timeout=15)
+    res["screenshot"] = shot
+    return res
 
 
 @mcp.tool()
@@ -1017,6 +1045,24 @@ def gui_set_config(
     if not p:
         return {"ok": True, "applied": {}, "hint": "no fields specified"}
     return _gui_invoke("set_config", p)
+
+
+@mcp.tool()
+def gui_load_session(path: str) -> dict[str, Any]:
+    """Open a previously-saved `.dsl` session file in the running GUI.
+    Counterpart to `gui_save_session` — lets the LLM (or user) keep
+    re-analysing a fixed dataset across conversations.
+
+    Args:
+        path: absolute path to a `.dsl` file. The GUI's active device
+            and channel layout are replaced with whatever was in the
+            file; current capture buffer is dropped.
+
+    Example:
+        >>> gui_load_session("/tmp/dsv_demo_run.dsl")
+        {"ok": true, "path": "/tmp/dsv_demo_run.dsl", "device": "Demo Device"}
+    """
+    return _gui_invoke("load_session", {"path": path}, timeout=30)
 
 
 @mcp.tool()
@@ -1120,6 +1166,171 @@ def gui_set_channel(channels: dict[str, bool] | None = None,
     if not p:
         return {"ok": False, "hint": "pass channels=... or index=...,enabled=..."}
     return _gui_invoke("set_channel", p)
+
+
+_PROTOCOL_PIN_HINTS: dict[str, dict[str, list[str]]] = {
+    # decoder_id (without 0:/1: prefix) -> pin_id -> channel-name keywords.
+    # First match wins. Case-insensitive substring match against the user's
+    # channel naming in the GUI / capture metadata.
+    "i2c":  {"sda": ["sda", "data"], "scl": ["scl", "clk"]},
+    "spi":  {"clk": ["clk", "sck", "sclk"],
+             "mosi": ["mosi", "do",  "sdi", "tx"],
+             "miso": ["miso", "di",  "sdo", "rx"],
+             "cs":   ["cs",   "ce",  "ss",  "select"]},
+    "uart": {"rxtx": ["rxtx", "tx", "rx", "uart", "ser"]},
+    "can":  {"can_rx": ["can", "rx"]},
+}
+
+
+def _suggest_channel_map(protocol: str,
+                         channels_meta: list[dict[str, Any]]) -> dict[str, int]:
+    """Heuristically map decoder pins → logic channel indices using the
+    user's channel names. `protocol` may be 'i2c' / '0:i2c' / '1:i2c'.
+    Returns a partial mapping (only pins whose name confidently matched);
+    the caller should reject if a required pin is missing."""
+    key = protocol.split(":")[-1].lower()
+    hints = _PROTOCOL_PIN_HINTS.get(key, {})
+    if not hints:
+        return {}
+    enabled = [c for c in channels_meta if c.get("enabled")]
+
+    mapped: dict[str, int] = {}
+    used: set[int] = set()
+    for pin, kw_list in hints.items():
+        for c in enabled:
+            if c["index"] in used:
+                continue
+            cname = (c.get("name") or "").lower()
+            if any(kw in cname for kw in kw_list):
+                mapped[pin] = c["index"]
+                used.add(c["index"])
+                break
+    return mapped
+
+
+@mcp.tool()
+def suggest_channel_map(capture_id: str, protocol: str) -> dict[str, Any]:
+    """Heuristically infer a `channel_map` for `decode()` from the user's
+    channel names. Useful when the user has already labeled channels in
+    DSView (e.g. ch0='SDA', ch1='SCL') — saves the LLM from re-asking.
+
+    Args:
+        capture_id: a capture saved by capture(...).
+        protocol:   decoder id (e.g. "1:i2c", "0:spi", "uart", "can-fd").
+
+    Example:
+        >>> suggest_channel_map(capture_id="ab12cd34", protocol="1:spi")
+        {"channel_map": {"clk": 1, "mosi": 14, "miso": 15, "cs": 13},
+         "matched": 4, "missing_required": []}
+    """
+    cap = _load_capture(capture_id)
+    chs = [{"index": c["index"], "enabled": c.get("enabled", False),
+            "name": c.get("name", "")} for c in cap.meta.get("channels", [])]
+    cmap = _suggest_channel_map(protocol, chs)
+
+    # Required pins from the DSL decoder list (best-effort — the helper
+    # already exposes that, but to keep this Pythonic we mirror the
+    # known minima here):
+    required = {
+        "i2c":  ["sda", "scl"],
+        "spi":  ["clk"],            # cs/mosi/miso optional
+        "uart": ["rxtx"],
+        "can":  ["can_rx"],
+    }.get(protocol.split(":")[-1].lower(), [])
+    missing = [p for p in required if p not in cmap]
+
+    return {
+        "channel_map": cmap,
+        "matched": len(cmap),
+        "missing_required": missing,
+        "hint": ("All required pins matched — pass channel_map straight "
+                 "to decode().") if not missing else
+                ("Channel names didn't cover required pin(s) " +
+                 ", ".join(missing) +
+                 ". Either rename the channels in DSView (Options → "
+                 "rename) or pass channel_map explicitly to decode()."),
+    }
+
+
+@mcp.tool()
+def auto_capture_and_decode(
+    protocol: str,
+    samplerate: int = 1_000_000,
+    depth: int = 200_000,
+    index: int = -1,
+    vth: float | None = 0.9,
+    options: dict[str, Any] | None = None,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """One-shot capture + decode. Captures with all-channels-enabled,
+    auto-derives channel_map from device-info channel names, then runs
+    the protocol decoder in summary mode.
+
+    Use this when the user just says "show me the I²C traffic" —
+    you don't have to chain capture → list_devices → decode by hand.
+
+    If channel-name auto-mapping fails, the response includes a
+    `suggested_channel_map` with whatever could be inferred plus the
+    raw `channels` list, so the caller can recover with one explicit
+    decode() call.
+
+    Args:
+        protocol:   decoder id (e.g. "1:i2c", "0:spi", "uart").
+        samplerate: capture rate.
+        depth:      capture depth (samples).
+        index:      device index from list_devices (-1 = last attached).
+        vth:        voltage threshold (default 0.9 for 1.8V logic).
+        options:    decoder options (baudrate / cpol / cpha / etc.).
+        name:       free-form tag for the capture.
+
+    Example:
+        >>> auto_capture_and_decode(protocol="1:i2c",
+        ...                         samplerate=25_000_000, depth=131_072,
+        ...                         index=0, vth=None,
+        ...                         name="demo-baseline")
+        {"capture_id": "...", "protocol": "1:i2c",
+         "channel_map": {"sda": 0, "scl": 1},
+         "streams": {"data-write": "04 02 02 02 06 07", ...},
+         "events":  [{"s": 45147, "l": "start", "t": "Start"}, ...]}
+    """
+    info = device_info(index=index)
+    chs = info.get("channels", [])
+    if not chs:
+        return {"ok": False, "error": "no enabled channels on this device",
+                "hint": "Run list_devices then device_info to inspect."}
+
+    enabled_idx = [c["index"] for c in chs]
+    cap = capture(
+        samplerate=samplerate, depth=depth, channels=enabled_idx,
+        index=index, vth=vth, name=name, confirm=True,
+    )
+    cap_id = cap.get("capture_id")
+    if not cap_id:
+        return {"ok": False, "error": "capture failed", "capture_response": cap}
+
+    cmap = _suggest_channel_map(protocol, chs)
+    if not cmap:
+        return {
+            "ok": False,
+            "capture_id": cap_id,
+            "error": "could not auto-map any decoder pin",
+            "channels": [{"index": c["index"], "name": c.get("name")}
+                          for c in chs],
+            "hint": ("Rename channels in DSView (e.g. SDA / SCL / CLK / "
+                     "MOSI / MISO / RXTX) or call decode() directly with "
+                     "an explicit channel_map."),
+        }
+
+    res = decode(
+        capture_id=cap_id, protocol=protocol,
+        channel_map=cmap, options=options,
+    )
+    res["capture_id"]  = cap_id
+    res["channel_map"] = cmap
+    res["captured_channels"] = [
+        {"index": c["index"], "name": c.get("name")} for c in chs
+    ]
+    return res
 
 
 _WORKFLOWS = [

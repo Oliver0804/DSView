@@ -636,5 +636,54 @@ QJsonObject McpServer::toolSaveSession(const QJsonObject &params,
     return r;
 }
 
+/* load_session({path: string}) — open a previously saved .dsl file in
+ * the GUI. Counterpart to save_session. */
+QJsonObject McpServer::toolLoadSession(const QJsonObject &params,
+                                       QString *err)
+{
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    if (_session->is_working()) {
+        if (err) *err = "device is currently capturing; call run_stop "
+                        "first before loading a session";
+        return {};
+    }
+    QString path = params.value("path").toString();
+    if (path.isEmpty()) {
+        if (err) *err = "params.path required (.dsl file to open)";
+        return {};
+    }
+    if (!QFileInfo(path).isFile()) {
+        if (err) *err = QStringLiteral("file not found: %1").arg(path);
+        return {};
+    }
+
+    /* SigSession::set_file() throws QString on failure — catch and
+     * surface as JSON-RPC error. */
+    try {
+        if (!_session->set_file(path)) {
+            if (err) *err = "set_file() returned false";
+            return {};
+        }
+    } catch (QString e) {
+        if (err) *err = QStringLiteral("set_file failed: %1").arg(e);
+        return {};
+    }
+
+    /* Refresh toolbar to mirror the loaded session's settings. */
+    if (_main_window && _main_window->getSamplingBar()) {
+        auto *sb = _main_window->getSamplingBar();
+        sb->update_device_list();
+        sb->update_sample_rate_list();
+        sb->update_view_status();
+    }
+
+    QJsonObject r;
+    r["ok"]   = true;
+    r["path"] = path;
+    if (_session->get_device())
+        r["device"] = _session->get_device()->name();
+    return r;
+}
+
 } // namespace mcp
 } // namespace pv

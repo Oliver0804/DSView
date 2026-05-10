@@ -95,6 +95,7 @@ private:
     QJsonObject toolSetCollectMode(const QJsonObject &params, QString *err);
     QJsonObject toolGetState(const QJsonObject &params, QString *err);
     QJsonObject toolSaveSession(const QJsonObject &params, QString *err);
+    QJsonObject toolLoadSession(const QJsonObject &params, QString *err);
 
 private:
     QTcpServer            _server;
