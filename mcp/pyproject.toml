@@ -1,0 +1,19 @@
+[project]
+name = "dsview-mcp"
+version = "0.1.0"
+description = "MCP server for DSView / DSLogic logic-analyzer capture and analysis"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+dsview-mcp = "dsview_mcp.server:main"
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["dsview_mcp"]
