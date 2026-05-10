@@ -145,6 +145,19 @@ static int json_int_field(const char *json, const char *key, int64_t *out)
     return 0;
 }
 
+/* Pull a "key":"value" string field. Caller frees with g_free. */
+static char *json_string_field(const char *json, const char *key)
+{
+    char pat[64];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    const char *end = strchr(p, '"');
+    if (!end) return NULL;
+    return g_strndup(p, end - p);
+}
+
 /* ---- map / option parsers ------------------------------------------ */
 
 /* "scl=0,sda=1" -> GHashTable<char*, GVariant*int32> */
@@ -337,9 +350,14 @@ int cmd_decode(const char *input_prefix,
     }
 
     int64_t samplerate = 0, unitsize = 0, samples_written = 0;
+    int64_t atom_samples = 0, atom_bytes = 0;
     json_int_field(json, "samplerate", &samplerate);
     json_int_field(json, "unitsize",   &unitsize);
     json_int_field(json, "samples_written", &samples_written);
+    json_int_field(json, "atomic_samples", &atom_samples);
+    json_int_field(json, "atomic_bytes_per_channel", &atom_bytes);
+    char *layout = json_string_field(json, "layout");
+    char *enabled_csv = json_string_field(json, "enabled_indices");
     g_free(json);
 
     if (unitsize <= 0 || samplerate <= 0) {
@@ -355,9 +373,60 @@ int cmd_decode(const char *input_prefix,
     if (!bin) {
         fprintf(stdout, "{\"ok\":false,\"error\":\"cannot read %s: %s\"}\n",
                 bin_path, strerror(errno));
+        g_free(layout); g_free(enabled_csv);
         g_free(json_path); g_free(bin_path);
         return 1;
     }
+
+    /* DSLogic / DSCope / virtual-demo emit a time-packed atomic-block layout:
+     * each block holds atom_samples samples × N enabled channels, stored as
+     * N consecutive (atom_bytes) per-channel runs of LSB-first packed bits.
+     * Decoders downstream want the legacy cross-byte format
+     * (one `unitsize`-byte slice per sample, channel C in bit (C%8) of
+     * byte (C/8)), so transform once here. */
+    if (layout && g_str_equal(layout, "dsl_atomic")
+            && atom_samples > 0 && atom_bytes > 0
+            && enabled_csv && *enabled_csv) {
+        /* Parse enabled-channel index list. */
+        GArray *en = g_array_new(FALSE, FALSE, sizeof(int));
+        char *dup = g_strdup(enabled_csv);
+        for (char *t = strtok(dup, ","); t; t = strtok(NULL, ",")) {
+            int v = atoi(t);
+            g_array_append_val(en, v);
+        }
+        g_free(dup);
+        int en_count = (int)en->len;
+        size_t block_bytes = (size_t)atom_bytes * (size_t)en_count;
+        if (en_count > 0 && block_bytes > 0) {
+            size_t n_blocks = bin_len / block_bytes;
+            size_t cross_bytes = n_blocks * (size_t)atom_samples
+                                  * (size_t)unitsize;
+            uint8_t *cross = g_malloc0(cross_bytes);
+            for (size_t blk = 0; blk < n_blocks; blk++) {
+                const uint8_t *blk_base = bin + blk * block_bytes;
+                for (int slot = 0; slot < en_count; slot++) {
+                    int ch = g_array_index(en, int, slot);
+                    size_t byte_in_slice = (size_t)ch / 8;
+                    uint8_t mask = (uint8_t)(1u << (ch % 8));
+                    const uint8_t *src = blk_base + (size_t)slot * atom_bytes;
+                    for (int s = 0; s < atom_samples; s++) {
+                        if (src[s / 8] & (1u << (s % 8))) {
+                            size_t global = blk * (size_t)atom_samples + s;
+                            cross[global * (size_t)unitsize + byte_in_slice]
+                                |= mask;
+                        }
+                    }
+                }
+            }
+            g_free(bin);
+            bin = cross;
+            bin_len = cross_bytes;
+        }
+        g_array_free(en, TRUE);
+    }
+    g_free(layout); layout = NULL;
+    g_free(enabled_csv); enabled_csv = NULL;
+
     int64_t total_samples = (int64_t)(bin_len / (size_t)unitsize);
 
     if (start_sample < 0) start_sample = 0;

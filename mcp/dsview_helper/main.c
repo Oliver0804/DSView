@@ -507,9 +507,13 @@ static int cmd_capture(int index, const char *output_prefix,
      * Demo and others fall back to cross-byte layout. */
     struct ds_device_full_info dinfo; memset(&dinfo, 0, sizeof(dinfo));
     ds_get_actived_device_info(&dinfo);
-    const char *layout = (g_str_has_prefix(dinfo.driver_name, "DSLogic") ||
-                          g_str_has_prefix(dinfo.driver_name, "DSCope"))
-                             ? "dsl_atomic" : "cross_byte";
+    /* libsigrok4DSL emits LA_CROSS_DATA in a time-packed atomic-block layout
+     * (each block = 64 samples × N enabled channels × 8 bytes/channel,
+     * LSB-first packed) for every supported driver — DSLogic, DSCope, and
+     * virtual-demo all use the same encoding. We default to atomic and only
+     * fall back to legacy cross_byte if a future driver explicitly differs. */
+    const char *layout = "dsl_atomic";
+    (void)dinfo;
 
     rc = ds_start_collect();
     if (rc != SR_OK) {
@@ -561,6 +565,16 @@ static int cmd_capture(int index, const char *output_prefix,
 
     GSList *chs = ds_get_actived_device_channels();
     char esc[256];
+    /* Build CSV of enabled-channel indices in driver order (which matches
+     * the order channels are packed into atomic blocks). */
+    GString *enabled_csv = g_string_new("");
+    for (GSList *l = chs; l; l = l->next) {
+        const struct sr_channel *ch = l->data;
+        if (!ch || ch->type != SR_CHANNEL_LOGIC || !ch->enabled) continue;
+        if (enabled_csv->len) g_string_append_c(enabled_csv, ',');
+        g_string_append_printf(enabled_csv, "%u", ch->index);
+    }
+
     fprintf(jf,
         "{\"ok\":true,"
         "\"bin\":\"%s\","
@@ -572,6 +586,7 @@ static int cmd_capture(int index, const char *output_prefix,
         "\"format\":\"%s\","
         "\"layout\":\"%s\","
         "\"enabled_channels\":%d,"
+        "\"enabled_indices\":\"%s\","
         "\"atomic_samples\":64,"
         "\"atomic_bytes_per_channel\":8,"
         "\"bytes\":%" PRIu64 ","
@@ -581,7 +596,9 @@ static int cmd_capture(int index, const char *output_prefix,
         final_unitsize,
         (g.logic_format == LA_SPLIT_DATA ? "split" : "cross"),
         layout, enabled_logic,
+        enabled_csv->str,
         g.bytes_written);
+    g_string_free(enabled_csv, TRUE);
     int first = 1;
     for (GSList *l = chs; l; l = l->next) {
         const struct sr_channel *ch = l->data;
