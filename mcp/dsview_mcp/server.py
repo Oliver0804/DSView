@@ -431,6 +431,23 @@ def capture(
         ...         vth=0.9, name="uart-bring-up", confirm=True)
         {"capture_id": "ab12cd34", "samples": 200000, ...}
 
+        >>> # Single-channel edge trigger (rising on ch0, 30% pre-trigger):
+        >>> capture(samplerate=1_000_000, depth=200_000, channels=[0,1,2,3],
+        ...         trigger_channel=0, trigger_edge="rising",
+        ...         trigger_pos_pct=30, name="trig-rising-ch0", confirm=True)
+        {"capture_id": "...", "trigger_position_sample": 60000,
+         "trigger_position_pct": 30, ...}
+
+        >>> # Multi-channel pattern trigger — i2c START condition:
+        >>> capture(samplerate=10_000_000, depth=500_000, channels=list(range(16)),
+        ...         trigger_pattern={"0": "falling", "1": "high"},
+        ...         trigger_pos_pct=20, trigger_holdoff_ns=5000,
+        ...         name="i2c-start-trig", confirm=True)
+        {"capture_id": "...", "trigger_position_sample": 100000, ...}
+        >>> # Then decode/read_window scope to the trigger area to save tokens:
+        >>> decode(capture_id="...", protocol="1:i2c",
+        ...        channel_map={"sda":0,"scl":1}, around_trigger_us=2000)
+
     Returns (confirm=False):
         {"preview": {…}, "needs_confirm": True, "hint": "..."}
 
@@ -826,6 +843,10 @@ def read_window(
         {"channel": 0, "start_sample": 0, "end_sample": 64,
          "samplerate": 1000000,
          "bits": "0011000011001100110011001100..."}
+
+        >>> # Trigger-relative ± window (±200µs centred on trigger):
+        >>> read_window(capture_id="ab12cd34", channel=0,
+        ...             around_trigger_us=400)
     """
     if length <= 0:
         return {"error": "length must be > 0"}
@@ -1067,6 +1088,18 @@ def decode(
         >>> decode(capture_id="ab12cd34", protocol="1:spi",
         ...        channel_map={"clk":12, "cs":13, "mosi":15, "miso":14},
         ...        options={"cpol": 1, "cpha": 1})
+
+        >>> # Stack 24xx EEPROM on top of i2c — high-level operations
+        >>> # (R / W / Sequential read / address bytes) on top of raw i2c.
+        >>> decode(capture_id="ab12cd34", protocol="1:i2c",
+        ...        channel_map={"sda": 0, "scl": 1},
+        ...        stack=["eeprom24xx"])
+
+        >>> # When the capture has a trigger, focus the decode on the
+        >>> # trigger area to drop the response 100×:
+        >>> decode(capture_id="ab12cd34", protocol="1:i2c",
+        ...        channel_map={"sda": 0, "scl": 1},
+        ...        around_trigger_us=2000)   # trigger ±1ms only
     """
     cap = _load_capture(capture_id)
     bin_path = cap.bin_path
@@ -1931,6 +1964,57 @@ _WORKFLOWS = [
             "gui_set_active_device(index=0)",
             "# 3) Retry the original stdio capture:",
             "capture(index=1, ..., confirm=True)",
+            "# 4) Capture returned 0 samples or stays stuck → reset:",
+            "reset_device(index=1)",
+            "# … then capture() again (or rely on capture's own auto-",
+            "# reset-and-retry, which fires for 0-sample results).",
+        ],
+    },
+    {
+        "name": "trigger-edge-with-window",
+        "purpose": "Edge trigger + decode only the window around the "
+                   "trigger so the LLM doesn't drown in token-heavy "
+                   "data from the rest of the buffer.",
+        "steps": [
+            "# 1) Single rising-edge trigger on ch0, 30% pre-trigger:",
+            "cap = capture(",
+            "    index=2, samplerate=10_000_000, depth=500_000,",
+            "    channels=[0,1,2,3], vth=0.9,",
+            "    trigger_channel=0, trigger_edge='rising',",
+            "    trigger_pos_pct=30, name='edge-trig', confirm=True)",
+            "# cap['trigger_position_sample'] = 150_000  (= 500k × 30%)",
+            "",
+            "# 2) Decode only ±1ms around the trigger (2k samples instead of 500k):",
+            "decode(capture_id=cap['capture_id'], protocol='1:spi',",
+            "       channel_map={'clk':1,'cs':0,'mosi':2,'miso':3},",
+            "       around_trigger_us=2000)",
+            "",
+            "# 3) Eyeball bits around trigger (±100µs):",
+            "read_window(capture_id=cap['capture_id'], channel=0,",
+            "            around_trigger_us=200)",
+        ],
+    },
+    {
+        "name": "i2c-start-pattern-trigger",
+        "purpose": "Catch an I²C START condition (SDA falling AND SCL "
+                   "high together) using the multi-channel pattern "
+                   "trigger, then decode the transaction with EEPROM "
+                   "stack on top.",
+        "steps": [
+            "# 1) Pattern trigger — SDA falling AND SCL high:",
+            "cap = capture(",
+            "    index=2, samplerate=25_000_000, depth=500_000,",
+            "    channels=list(range(16)),",
+            "    trigger_pattern={'0': 'falling', '1': 'high'},",
+            "    trigger_pos_pct=10, trigger_holdoff_ns=5000,",
+            "    name='i2c-start', confirm=True)",
+            "",
+            "# 2) Decode with eeprom24xx stacked on i2c, focused on",
+            "# the trigger window:",
+            "decode(capture_id=cap['capture_id'], protocol='1:i2c',",
+            "       channel_map={'sda': 0, 'scl': 1},",
+            "       stack=['eeprom24xx'],",
+            "       around_trigger_us=4000)",
         ],
     },
 ]
@@ -1955,7 +2039,9 @@ def workflows() -> dict[str, Any]:
                      {"name": "spi-iterate-mapping", ...},
                      {"name": "interactive-with-gui", ...},
                      {"name": "two-agents-different-devices", ...},
-                     {"name": "recover-from-busy", ...}]}
+                     {"name": "recover-from-busy", ...},
+                     {"name": "trigger-edge-with-window", ...},
+                     {"name": "i2c-start-pattern-trigger", ...}]}
     """
     return {"recipes": _WORKFLOWS}
 
