@@ -357,6 +357,12 @@ struct capture_opts {
     char   trigger_edge;       /* 'R' rise | 'F' fall | 'C' either |
                                 * '1' high | '0' low | 'X' off       */
     int    trigger_pos_pct;    /* 0..100 (pre-trigger %), -1 = default */
+    /* Optional multi-channel pattern (single-stage). String form is
+     * the same the GUI's TriggerDock uses: 16 char codes separated by
+     * spaces, leftmost char → highest probe index (probe 15 for a
+     * 16-channel device), rightmost → probe 0. NULL = use the simple
+     * trigger_channel/edge above instead. */
+    const char *trigger_pattern;
 };
 
 static int cmd_capture(int index, const char *output_prefix,
@@ -523,11 +529,15 @@ static int cmd_capture(int index, const char *output_prefix,
                         opts->max_height, sr_error_str(rc));
         }
 
-        /* Simple trigger setup. DSLogic only honours triggers in Buffer
-         * mode, so auto-flip OPERATION_MODE if the caller asked for a
-         * trigger but didn't explicitly choose Buffer. Stream mode just
-         * silently drops the trigger config otherwise. */
-        if (opts->trigger_channel >= 0 && opts->trigger_edge != 'X') {
+        /* Trigger setup. DSLogic only honours triggers in Buffer mode,
+         * so auto-flip OPERATION_MODE if the caller asked for a trigger
+         * but didn't explicitly choose Buffer. Stream mode just silently
+         * drops the trigger config otherwise. The pattern path takes
+         * precedence over the single-channel one when both are set. */
+        bool want_trigger =
+            (opts->trigger_pattern && *opts->trigger_pattern) ||
+            (opts->trigger_channel >= 0 && opts->trigger_edge != 'X');
+        if (want_trigger) {
             if (opts->operation_mode < 0) {
                 GVariant *gv = g_variant_new_int16(0); /* LO_OP_BUFFER */
                 ds_set_actived_device_config(NULL, NULL,
@@ -536,9 +546,39 @@ static int cmd_capture(int index, const char *output_prefix,
                         "info: trigger requested — auto-set Buffer mode\n");
             }
             ds_trigger_reset();
-            ds_trigger_probe_set((uint16_t)opts->trigger_channel,
-                                 (unsigned char)opts->trigger_edge,
-                                 'X');
+            if (opts->trigger_pattern && *opts->trigger_pattern) {
+                /* Multi-channel single-stage pattern. The string is
+                 * already in the GUI format ("X X 1 F X..." — leftmost
+                 * char is highest probe). value1 stays all-X.
+                 * Build an "X X X..." string the same length as the
+                 * caller's pattern; mismatched length is fine because
+                 * lib_ctx counts probes from the second arg. */
+                size_t plen = strlen(opts->trigger_pattern);
+                char *all_x = g_malloc(plen + 1);
+                for (size_t k = 0; k < plen; k++)
+                    all_x[k] = (opts->trigger_pattern[k] == ' ') ? ' ' : 'X';
+                all_x[plen] = '\0';
+                /* Probe count derived from the pattern itself: chars
+                 * with no separator => 1 probe per char; with spaces
+                 * => (len+1)/2 probes. */
+                uint16_t pattern_probes = 0;
+                for (size_t k = 0; k < plen; k++)
+                    if (opts->trigger_pattern[k] != ' ')
+                        pattern_probes++;
+                if (pattern_probes == 0) pattern_probes = 16;
+                ds_trigger_stage_set_value(0, pattern_probes,
+                                           (char *)opts->trigger_pattern,
+                                           all_x);
+                g_free(all_x);
+                fprintf(stderr,
+                        "info: pattern trigger '%s' (probes=%u, "
+                        "leftmost = highest)\n",
+                        opts->trigger_pattern, pattern_probes);
+            } else {
+                ds_trigger_probe_set((uint16_t)opts->trigger_channel,
+                                     (unsigned char)opts->trigger_edge,
+                                     'X');
+            }
             ds_trigger_set_en(1);
             if (opts->trigger_pos_pct >= 0
                 && opts->trigger_pos_pct <= 100) {
@@ -959,11 +999,15 @@ static int cmd_daemon(int bind_index,
                                                      "trigger_pos_pct", -1),
             };
             char max_height[32]; char trigger_edge_w[16];
+            char trigger_pattern[128];
             json_get_str(line, "max_height", max_height, sizeof(max_height));
             json_get_str(line, "trigger_edge",
                          trigger_edge_w, sizeof(trigger_edge_w));
+            json_get_str(line, "trigger_pattern",
+                         trigger_pattern, sizeof(trigger_pattern));
             if (max_height[0]) opts.max_height = max_height;
             opts.trigger_edge = parse_trigger_edge_word(trigger_edge_w);
+            if (trigger_pattern[0]) opts.trigger_pattern = trigger_pattern;
 
             cmd_capture(bind_index, output, samplerate, depth,
                         channels[0] ? channels : NULL,
@@ -1031,6 +1075,7 @@ int main(int argc, char **argv)
         .trigger_channel = -1,
         .trigger_edge   = 'X',
         .trigger_pos_pct = -1,
+        .trigger_pattern = NULL,
     };
     long long start_sample = 0;
     long long end_sample = 0;
@@ -1056,6 +1101,7 @@ int main(int argc, char **argv)
         {"trigger-edge",    required_argument, 0, 1010},
         {"trigger-pos",     required_argument, 0, 1011},
         {"bind-index",      required_argument, 0, 1012},
+        {"trigger-pattern", required_argument, 0, 1014},
         {"firmware",     required_argument, 0, 'f'},
         {"user-data",    required_argument, 0, 'u'},
         {"protocol",     required_argument, 0, 'P'},
@@ -1112,6 +1158,7 @@ int main(int argc, char **argv)
         case 1011: opts.trigger_pos_pct = atoi(optarg); break;
         case 1012: bind_index = atoi(optarg); break;
         case 1013: stack       = optarg;       break;
+        case 1014: opts.trigger_pattern = optarg; break;
         case 'f': firmware   = optarg;       break;
         case 'u': user_data  = optarg;       break;
         case 'P': protocol   = optarg;       break;

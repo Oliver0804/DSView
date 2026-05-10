@@ -358,6 +358,7 @@ def capture(
     trigger_channel: int | None = None,
     trigger_edge: str | None = None,
     trigger_pos_pct: int | None = None,
+    trigger_pattern: dict[str, str] | str | None = None,
 ) -> dict[str, Any]:
     """Run a single logic capture on the selected device. **Two-step**.
 
@@ -407,6 +408,12 @@ def capture(
         trigger_pos_pct: 0..100 — fraction of the buffer kept *before*
              the trigger fires (50 = half pre / half post). Default
              leaves the device's current setting.
+        trigger_pattern: multi-channel single-stage trigger. Maps
+             channel index → edge keyword:
+                {"0": "falling", "1": "high"}   # i2c START condition
+                {"3": "rising", "10": "high"}   # SPI CS edge while CLK high
+             Wins over `trigger_channel`/`trigger_edge` when both are
+             set. Channels not listed default to 'X' (don't care).
 
     Example:
         >>> # Step 1: dry-run to inspect settings
@@ -430,6 +437,32 @@ def capture(
                                _BUFFER_OPTIONS)
     filter_i   = _resolve_enum("filter", filter, _FILTERS)
 
+    # Encode trigger_pattern into the GUI-format string the helper
+    # forwards to ds_trigger_stage_set_value (`X X 1 F X...`, leftmost
+    # char = highest probe). Done here so dry-run preview shows the
+    # exact string we'll feed to the lib.
+    trigger_pattern_str: str | None = None
+    if trigger_pattern is not None:
+        if isinstance(trigger_pattern, str):
+            trigger_pattern_str = trigger_pattern
+        elif isinstance(trigger_pattern, dict):
+            edge_char = {
+                "rising":  "R", "r": "R",
+                "falling": "F", "f": "F",
+                "either":  "C", "edge": "C", "c": "C",
+                "high":    "1", "1": "1",
+                "low":     "0", "0": "0",
+                "x":       "X", "any": "X", "dontcare": "X",
+            }
+            n_probes = max(int(k) for k in trigger_pattern) + 1
+            n_probes = max(n_probes, 16)
+            slots = ["X"] * n_probes
+            for k, v in trigger_pattern.items():
+                idx = int(k)
+                slots[n_probes - 1 - idx] = edge_char.get(
+                    str(v).strip().lower(), "X")
+            trigger_pattern_str = " ".join(slots)
+
     settings = {
         "samplerate": samplerate,
         "depth": depth,
@@ -449,6 +482,7 @@ def capture(
         "trigger_channel": trigger_channel,
         "trigger_edge": trigger_edge,
         "trigger_pos_pct": trigger_pos_pct,
+        "trigger_pattern": trigger_pattern_str,
     }
 
     if not confirm:
@@ -488,6 +522,7 @@ def capture(
             params["trigger_channel"] = int(trigger_channel)
         if trigger_edge:                   params["trigger_edge"]   = str(trigger_edge)
         if trigger_pos_pct is not None:    params["trigger_pos_pct"] = int(trigger_pos_pct)
+        if trigger_pattern_str:            params["trigger_pattern"] = trigger_pattern_str
 
         daemon_attempted = True
         try:
@@ -540,6 +575,8 @@ def capture(
             args += ["--trigger-edge", str(trigger_edge)]
         if trigger_pos_pct is not None:
             args += ["--trigger-pos", str(int(trigger_pos_pct))]
+        if trigger_pattern_str:
+            args += ["--trigger-pattern", trigger_pattern_str]
 
         _run_helper(args, timeout=timeout_sec + 30)
     elapsed = time.time() - t0
@@ -591,6 +628,8 @@ def capture(
                 spawn_args += ["--trigger-edge", str(trigger_edge)]
             if trigger_pos_pct is not None:
                 spawn_args += ["--trigger-pos", str(int(trigger_pos_pct))]
+            if trigger_pattern_str:
+                spawn_args += ["--trigger-pattern", trigger_pattern_str]
             _run_helper(spawn_args, timeout=timeout_sec + 30)
             cap = _load_capture(cap_id)
         except HelperError as e:
