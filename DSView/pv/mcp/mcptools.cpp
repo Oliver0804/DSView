@@ -21,6 +21,7 @@
 #include "../sigsession.h"
 #include "../deviceagent.h"
 #include "../mainwindow.h"
+#include "../toolbars/samplingbar.h"
 #include "../log.h"
 
 namespace pv {
@@ -277,12 +278,30 @@ static const ConfigKeyDesc CONFIG_KEYS[] = {
     {"max_height",         SR_CONF_MAX_HEIGHT,      's'},
     {"samplerate",         SR_CONF_SAMPLERATE,      'u'},
     {"depth",              SR_CONF_LIMIT_SAMPLES,   'u'},
+    /* virtual-demo: pick the pattern source. "random" = pseudo-random,
+     * any other string is the basename of a .demo file under
+     * ~/.dsview/demo/logic (e.g. "protocol"). Has no effect on real
+     * DSLogic / DSCope devices. */
+    {"pattern_mode",       SR_CONF_PATTERN_MODE,    's'},
 };
 
 static const ConfigKeyDesc *config_lookup(const QString &name) {
     for (const auto &d : CONFIG_KEYS)
         if (name == QLatin1String(d.name)) return &d;
     return nullptr;
+}
+
+/* After tweaking driver-level config, ask the toolbar widgets to re-read
+ * the device state so their dropdowns reflect what changed. The various
+ * sampling_bar slots are private but update_sample_rate_list / device
+ * list are public. */
+static void refresh_toolbar_from_device(MainWindow *mw)
+{
+    if (!mw) return;
+    auto *sb = mw->getSamplingBar();
+    if (!sb) return;
+    sb->update_sample_rate_list();
+    sb->update_view_status();
 }
 
 /* Apply one (key, value) pair against the active device. Returns "" on
@@ -410,16 +429,56 @@ QJsonObject McpServer::toolInstantShot(const QJsonObject &params, QString *err)
 QJsonObject McpServer::toolSetActiveDevice(const QJsonObject &params,
                                            QString *err)
 {
-    int idx = params.value("index").toInt(-1);
-    if (idx < 0) { if (err) *err = "params.index required"; return {}; }
-    int rc = ds_active_device_by_index(idx);
-    if (rc != SR_OK) {
-        if (err) *err = QStringLiteral("ds_active_device_by_index(%1) -> %2")
-            .arg(idx).arg(sr_error_str(rc));
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    if (_session->is_working()) {
+        if (err) *err = "device is currently capturing; call run_stop "
+                        "first before switching active device";
         return {};
     }
-    QJsonObject r; r["ok"] = true; r["index"] = idx;
-    if (_session && _session->get_device())
+
+    /* Accept either {index} or {handle}. */
+    qint64 want_handle = params.value("handle").toVariant().toLongLong();
+    int    idx         = params.value("index").toInt(-1);
+
+    if (want_handle == 0) {
+        if (idx < 0) {
+            if (err) *err = "params.index or params.handle required";
+            return {};
+        }
+        struct ds_device_base_info *arr = nullptr;
+        int count = 0;
+        ds_reload_device_list();
+        if (ds_get_device_list(&arr, &count) != SR_OK || !arr || idx >= count) {
+            if (arr) g_free(arr);
+            if (err) *err = QStringLiteral("index %1 out of range").arg(idx);
+            return {};
+        }
+        want_handle = (qint64)arr[idx].handle;
+        g_free(arr);
+    }
+
+    /* SigSession::set_device() does the full GUI-side switch: releases the
+     * old DeviceAgent, calls ds_active_device(handle), refreshes the agent,
+     * resets collect mode, and emits the signals the toolbar listens for. */
+    if (!_session->set_device((ds_device_handle)want_handle)) {
+        if (err) *err = "SigSession::set_device() failed";
+        return {};
+    }
+
+    /* Make the device dropdown / samplerate / depth selectors mirror the
+     * new active device. */
+    if (_main_window && _main_window->getSamplingBar()) {
+        auto *sb = _main_window->getSamplingBar();
+        sb->update_device_list();
+        sb->update_sample_rate_list();
+        sb->update_view_status();
+    }
+
+    QJsonObject r;
+    r["ok"]     = true;
+    r["index"]  = idx;
+    r["handle"] = want_handle;
+    if (_session->get_device())
         r["name"] = _session->get_device()->name();
     return r;
 }
@@ -435,6 +494,7 @@ QJsonObject McpServer::toolSetConfig(const QJsonObject &params, QString *err)
         if (e.isEmpty()) applied[it.key()] = it.value();
         else            errors[it.key()] = e;
     }
+    if (!applied.isEmpty()) refresh_toolbar_from_device(_main_window);
     QJsonObject r;
     r["applied"] = applied;
     if (!errors.isEmpty()) r["errors"] = errors;
@@ -461,6 +521,7 @@ QJsonObject McpServer::toolSetChannel(const QJsonObject &params, QString *err)
         ds_enable_device_channel_index(it.key().toInt(), en ? TRUE : FALSE);
         applied[it.key()] = en;
     }
+    refresh_toolbar_from_device(_main_window);
     QJsonObject r; r["ok"] = true; r["channels"] = applied; return r;
 }
 

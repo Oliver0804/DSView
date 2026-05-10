@@ -105,6 +105,7 @@ public:
 
     inline EventObject* getEvent() { return &_event; }
     inline SigSession*  getSession() { return _session; }
+    inline toolbars::SamplingBar* getSamplingBar() { return _sampling_bar; }
 
 public slots: 
     void switchTheme(QString style);
