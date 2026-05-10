@@ -546,6 +546,57 @@ def capture(
 
     cap = _load_capture(cap_id)
 
+    # 0-samples means the device armed but never delivered data — usually
+    # a stuck USB session. Auto-reset (kills daemon for this index) and
+    # retry once via spawn-on-call so we don't fight the same daemon.
+    if cap.samples == 0 and index >= 1:
+        try:
+            print(f"[dsview-mcp] capture index={index} returned 0 samples; "
+                  "auto-reset + spawn-retry once", file=sys.stderr)
+            reset_device(index)
+            time.sleep(0.8)
+            cap_id = uuid.uuid4().hex[:8]
+            prefix = WORKDIR / f"cap-{cap_id}"
+            spawn_args = [
+                "capture",
+                "--index", str(index),
+                "--output", str(prefix),
+                "--samplerate", str(samplerate),
+                "--depth", str(depth),
+                "--timeout", str(timeout_sec),
+            ]
+            if channels:
+                spawn_args += ["--channels",
+                               ",".join(str(c) for c in channels)]
+            if vth is not None: spawn_args += ["--vth", str(vth)]
+            if op_mode_i is not None:
+                spawn_args += ["--operation-mode", str(op_mode_i)]
+            if buf_opt_i is not None:
+                spawn_args += ["--buffer-option", str(buf_opt_i)]
+            if filter_i is not None:
+                spawn_args += ["--filter", str(filter_i)]
+            if channel_mode is not None:
+                spawn_args += ["--channel-mode", str(int(channel_mode))]
+            if rle is not None:
+                spawn_args += ["--rle", "1" if rle else "0"]
+            if ext_clock is not None:
+                spawn_args += ["--ext-clock", "1" if ext_clock else "0"]
+            if falling_edge_clock is not None:
+                spawn_args += ["--falling-edge",
+                               "1" if falling_edge_clock else "0"]
+            if max_height: spawn_args += ["--max-height", max_height]
+            if trigger_channel is not None and trigger_channel >= 0:
+                spawn_args += ["--trigger-channel", str(int(trigger_channel))]
+            if trigger_edge:
+                spawn_args += ["--trigger-edge", str(trigger_edge)]
+            if trigger_pos_pct is not None:
+                spawn_args += ["--trigger-pos", str(int(trigger_pos_pct))]
+            _run_helper(spawn_args, timeout=timeout_sec + 30)
+            cap = _load_capture(cap_id)
+        except HelperError as e:
+            print(f"[dsview-mcp] auto-reset retry failed: {e}",
+                  file=sys.stderr)
+
     # Persist user-supplied tag into the metadata file so list_captures
     # can surface it without re-deriving from log/timestamp guesses.
     if name:
@@ -1365,6 +1416,43 @@ def _daemon_eligible_index(index: int) -> bool:
     if index == 0:
         return False
     return True
+
+
+@mcp.tool()
+def reset_device(index: int, kill_daemon: bool = True) -> dict[str, Any]:
+    """Force-release a USB device that's stuck. Use after a capture
+    times out, returns 0 samples, or you see 'active-device mismatch'
+    that doesn't clear with a couple retries.
+
+    What it does:
+      1. If `kill_daemon=True` and a per-device daemon is alive, ask
+         it to shutdown so the USB handle drops cleanly.
+      2. Spawn `dsview_helper reset --index N`, which calls
+         ds_active_device_by_index → ds_release_actived_device →
+         lets hotplug re-enumerate. The next list_devices / capture
+         sees a fresh device.
+
+    Args:
+        index: device index from list_devices.
+        kill_daemon: also tear down the long-running daemon for this
+            index (recommended; otherwise the daemon still holds the
+            stale session).
+
+    Example:
+        >>> reset_device(index=2)
+        {"ok": true, "reset": true, "index": 2, "name": "DSLogic PLus"}
+    """
+    # Drop daemon first so it doesn't fight for the same handle.
+    if kill_daemon and _daemon_pool is not None:
+        with _daemon_pool._lock:  # noqa: SLF001
+            d = _daemon_pool._pool.pop(index, None)  # noqa: SLF001
+        if d is not None:
+            try: d.close()
+            except Exception: pass
+
+    res = _run_helper(["reset", "--index", str(index)],
+                      timeout=30, retries=1)
+    return res
 
 
 @mcp.tool()

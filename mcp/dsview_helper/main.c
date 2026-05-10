@@ -704,6 +704,57 @@ static int cmd_capture(int index, const char *output_prefix,
     return g.error_flag ? 2 : 0;
 }
 
+/* ---- subcommand: reset (release-and-rescan a stuck USB device) -------- */
+
+static int cmd_reset_device(int index,
+                            const char *firmware_dir,
+                            const char *user_data_dir)
+{
+    int rc = ensure_lib_init(firmware_dir, user_data_dir);
+    if (rc != SR_OK) {
+        emit_error("reset: ds_lib_init failed: %s", sr_error_str(rc));
+        return 1;
+    }
+    usleep(600 * 1000);
+    ds_reload_device_list();
+
+    /* Activate the requested slot, then release — this calls
+     * close_device_instance() which closes the USB handle and tears
+     * down the per-device session. Subsequent enumeration sees the
+     * device fresh. */
+    if ((rc = ds_active_device_by_index(index)) != SR_OK) {
+        emit_error("reset: activate index %d failed: %s",
+                   index, sr_error_str(rc));
+        return 1;
+    }
+
+    char name[150] = {0};
+    {
+        struct ds_device_full_info dinfo;
+        memset(&dinfo, 0, sizeof(dinfo));
+        ds_get_actived_device_info(&dinfo);
+        strncpy(name, dinfo.name, sizeof(name) - 1);
+    }
+
+    rc = ds_release_actived_device();
+    if (rc != SR_OK) {
+        emit_error("reset: ds_release_actived_device failed: %s",
+                   sr_error_str(rc));
+        return 1;
+    }
+
+    /* Let hotplug re-enumerate before returning so the next call
+     * sees a fresh device list. */
+    usleep(800 * 1000);
+    ds_reload_device_list();
+
+    char esc[300];
+    printf("{\"ok\":true,\"reset\":true,\"index\":%d,\"name\":\"%s\"}\n",
+           index, json_escape(name, esc, sizeof(esc)));
+    fflush(stdout);
+    return 0;
+}
+
 /* ---- subcommand: daemon (long-running, fixed-bind) -------------------- */
 
 /* Tiny JSON-line scanners. The daemon protocol is one request per stdin
@@ -850,6 +901,24 @@ static int cmd_daemon(int bind_index,
         }
         if (!strcmp(method, "device_info")) {
             cmd_device_info(bind_index, firmware_dir, user_data_dir);
+            fflush(stdout);
+            continue;
+        }
+        if (!strcmp(method, "reset")) {
+            /* Release + re-activate the same slot. Lets the parent
+             * unstick a hung USB session without killing the daemon. */
+            int rc2 = ds_release_actived_device();
+            usleep(800 * 1000);
+            ds_reload_device_list();
+            int rc3 = ds_active_device_by_index(bind_index);
+            if (rc2 == SR_OK && rc3 == SR_OK) {
+                printf("{\"ok\":true,\"reset\":true,\"index\":%d}\n",
+                       bind_index);
+            } else {
+                printf("{\"ok\":false,\"error\":\"reset: release=%s, "
+                       "reactivate=%s\"}\n",
+                       sr_error_str(rc2), sr_error_str(rc3));
+            }
             fflush(stdout);
             continue;
         }
@@ -1063,6 +1132,9 @@ int main(int argc, char **argv)
 
     if (strcmp(cmd, "list-devices") == 0) {
         return cmd_list_devices(firmware, user_data);
+    } else if (strcmp(cmd, "reset") == 0) {
+        if (index < 0) { emit_error("reset: --index required"); return 64; }
+        return cmd_reset_device(index, firmware, user_data);
     } else if (strcmp(cmd, "daemon") == 0) {
         int idx = bind_index >= 0 ? bind_index : index;
         if (idx < 0) { emit_error("daemon: --bind-index required"); return 64; }
