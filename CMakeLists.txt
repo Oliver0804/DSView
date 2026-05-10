@@ -245,6 +245,7 @@ set(DSView_SOURCES
     DSView/pv/mainwindow.cpp
     DSView/pv/mcp/mcpserver.cpp
     DSView/pv/mcp/mcptools.cpp
+    DSView/pv/dialogs/mcplogdlg.cpp
     DSView/pv/data/snapshot.cpp
     DSView/pv/data/signaldata.cpp
     DSView/pv/data/logicsnapshot.cpp
@@ -366,6 +367,7 @@ set(DSView_HEADERS
     DSView/pv/sigsession.h
     DSView/pv/mainwindow.h
     DSView/pv/mcp/mcpserver.h
+    DSView/pv/dialogs/mcplogdlg.h
     DSView/pv/dialogs/deviceoptions.h
     DSView/pv/prop/property.h
     DSView/pv/prop/int.h

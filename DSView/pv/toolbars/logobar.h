@@ -56,6 +56,10 @@ public:
         _mainForm = callback;
     }
 
+    /* Reflect the current MCP server state in the menu (the checkable
+     * "MCP Server" entry). Called by MainWindow whenever it changes. */
+    void set_mcp_listening(bool on);
+
 private:
     void retranslateUi();
     void reStyle();
@@ -65,9 +69,14 @@ private:
     void UpdateTheme() override;
     void UpdateFont() override;
 
-signals: 
+signals:
     //post event message to open user help document, MainWindow class receive it
-    void sig_open_doc(); 
+    void sig_open_doc();
+
+    /* MCP server menu — emitted when the user toggles the
+     * "MCP Server" checkbox or selects "MCP Logs..." */
+    void sig_mcp_toggle(bool on);
+    void sig_mcp_show_log();
 
 private slots:
     void on_actionEn_triggered();
@@ -79,6 +88,8 @@ private slots:
     void on_action_setting_log();
     void on_open_log_file();
     void on_clear_log_file();
+    void on_mcp_toggle(bool checked);
+    void on_mcp_log_triggered();
 
 private:
     bool _enable;
@@ -98,6 +109,8 @@ private:
     QAction *_issue;
     QAction *_update;
     QAction *_log;
+    QAction *_mcp_enable;
+    QAction *_mcp_log;
 
     QPushButton *_log_open_bt;
     QPushButton *_log_clear_bt;

@@ -77,6 +77,10 @@ namespace mcp {
 class McpServer;
 }
 
+namespace dialogs {
+class McpLogDialog;
+}
+
 //The mainwindow,referenced by MainFrame
 //TODO: create graph view,toolbar,and show device list
 class MainWindow : 
@@ -132,7 +136,10 @@ private slots:
     void on_trigger_message(int msg);
     void on_delay_prop_msg();
     void on_load_device_first();
-  
+
+    void on_mcp_toggle(bool on);
+    void on_mcp_show_log();
+
 signals:
     void prgRate(int progress);
 
@@ -240,7 +247,9 @@ private:
     QTranslator     _myTrans;
     EventObject     _event;
     SigSession      *_session;
-    pv::mcp::McpServer *_mcp_server = nullptr;
+    pv::mcp::McpServer        *_mcp_server  = nullptr;
+    pv::dialogs::McpLogDialog *_mcp_log_dlg = nullptr;
+    static const quint16       MCP_DEFAULT_PORT = 7384;
     DeviceAgent     *_device_agent;
     bool            _is_auto_switch_device;
     high_resolution_clock::time_point _last_key_press_time;

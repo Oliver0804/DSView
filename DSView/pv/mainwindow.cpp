@@ -98,6 +98,7 @@
 #include "sigsession.h"
 #include "deviceagent.h"
 #include "mcp/mcpserver.h"
+#include "dialogs/mcplogdlg.h"
 #include <stdlib.h>
 #include "ZipMaker.h"
 #include "ui/langresource.h"
@@ -143,11 +144,10 @@ namespace pv
 
         update_title_bar_text();
 
-        /* Embedded MCP server — listens on 127.0.0.1 so Claude Code can
-         * drive DSView from outside the GUI. */
+        /* Embedded MCP server — created upfront so the log dialog can be
+         * opened at any time, but not started until the user toggles
+         * "MCP Server" in the Help menu (LogoBar). */
         _mcp_server = new pv::mcp::McpServer(_session, this, this);
-        if (!_mcp_server->start(7384))
-            dsv_warn("MCP server failed to start (port 7384 in use?)");
     }
 
     void MainWindow::setup_ui()
@@ -294,6 +294,10 @@ namespace pv
 
         // logobar
         connect(_logo_bar, SIGNAL(sig_open_doc()), this, SLOT(on_open_doc()));
+        connect(_logo_bar, SIGNAL(sig_mcp_toggle(bool)), this, SLOT(on_mcp_toggle(bool)));
+        connect(_logo_bar, SIGNAL(sig_mcp_show_log()), this, SLOT(on_mcp_show_log()));
+        if (_mcp_server)
+            _logo_bar->set_mcp_listening(_mcp_server->isListening());
 
         connect(_protocol_widget, SIGNAL(protocol_updated()), this, SLOT(on_signals_changed()));
 
@@ -1457,6 +1461,42 @@ namespace pv
     void MainWindow::on_open_doc()
     {
         openDoc();
+    }
+
+    void MainWindow::on_mcp_toggle(bool on)
+    {
+        if (!_mcp_server) {
+            _mcp_server = new pv::mcp::McpServer(_session, this, this);
+        }
+        if (on) {
+            if (!_mcp_server->isListening()
+                && !_mcp_server->start(MCP_DEFAULT_PORT)) {
+                dsv_warn("MCP server failed to start (port %u in use?)",
+                         MCP_DEFAULT_PORT);
+                if (_logo_bar)
+                    _logo_bar->set_mcp_listening(false);
+                return;
+            }
+        } else {
+            _mcp_server->stop();
+        }
+        if (_logo_bar)
+            _logo_bar->set_mcp_listening(_mcp_server->isListening());
+    }
+
+    void MainWindow::on_mcp_show_log()
+    {
+        if (!_mcp_server) {
+            _mcp_server = new pv::mcp::McpServer(_session, this, this);
+        }
+        if (!_mcp_log_dlg) {
+            _mcp_log_dlg = new pv::dialogs::McpLogDialog(this, _mcp_server);
+            _mcp_log_dlg->setModal(false);
+        }
+        _mcp_log_dlg->refresh_status();
+        _mcp_log_dlg->show();
+        _mcp_log_dlg->raise();
+        _mcp_log_dlg->activateWindow();
     }
 
     void MainWindow::openDoc()

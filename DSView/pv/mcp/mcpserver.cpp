@@ -1,5 +1,6 @@
 #include "mcpserver.h"
 
+#include <QDateTime>
 #include <QHostAddress>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -36,22 +37,37 @@ McpServer::McpServer(SigSession *session, MainWindow *main_window,
 
 McpServer::~McpServer() = default;
 
+void McpServer::log(const QString &text)
+{
+    QString line = QStringLiteral("[%1] %2")
+        .arg(QDateTime::currentDateTime().toString("hh:mm:ss.zzz"))
+        .arg(text);
+    emit logMessage(line);
+}
+
 bool McpServer::start(quint16 port)
 {
     if (_server.isListening()) return true;
 
     if (!_server.listen(QHostAddress::LocalHost, port)) {
-        dsv_err("MCP: failed to listen on 127.0.0.1:%u — %s",
-                port, _server.errorString().toUtf8().data());
+        QString msg = QStringLiteral("listen on 127.0.0.1:%1 failed — %2")
+            .arg(port).arg(_server.errorString());
+        dsv_err("MCP: %s", msg.toUtf8().data());
+        log(msg);
         return false;
     }
-    dsv_info("MCP: listening on 127.0.0.1:%u", _server.serverPort());
+    QString msg = QStringLiteral("listening on 127.0.0.1:%1")
+        .arg(_server.serverPort());
+    dsv_info("MCP: %s", msg.toUtf8().data());
+    log(msg);
     return true;
 }
 
 void McpServer::stop()
 {
+    if (!_server.isListening()) return;
     _server.close();
+    log(QStringLiteral("server stopped"));
 }
 
 void McpServer::onNewConnection()
@@ -63,8 +79,9 @@ void McpServer::onNewConnection()
                 this, &McpServer::onClientReadyRead);
         connect(sock, &QTcpSocket::disconnected,
                 this, &McpServer::onClientDisconnected);
-        dsv_info("MCP: client connected from %s",
-                 sock->peerAddress().toString().toUtf8().data());
+        QString peer = sock->peerAddress().toString();
+        dsv_info("MCP: client connected from %s", peer.toUtf8().data());
+        log(QStringLiteral("client connected from %1").arg(peer));
     }
 }
 
@@ -73,6 +90,7 @@ void McpServer::onClientDisconnected()
     QTcpSocket *sock = qobject_cast<QTcpSocket *>(sender());
     if (!sock) return;
     dsv_info("MCP: client disconnected");
+    log(QStringLiteral("client disconnected"));
     if (_pending_capture.sock.data() == sock)
         _pending_capture = PendingCapture{};
     sock->deleteLater();
@@ -109,6 +127,8 @@ void McpServer::handleLine(QTcpSocket *sock, const QByteArray &line)
     QJsonValue  id  = req.value("id");
     QString method  = req.value("method").toString();
     QJsonObject par = req.value("params").toObject();
+
+    log(QStringLiteral("→ %1").arg(method.isEmpty() ? "<no-method>" : method));
 
     QString err;
     QJsonObject result;
@@ -175,6 +195,7 @@ void McpServer::writeError(QTcpSocket *sock,
     sock->write(doc.toJson(QJsonDocument::Compact));
     sock->write("\n");
     sock->flush();
+    log(QStringLiteral("← error %1: %2").arg(code).arg(message));
 }
 
 void McpServer::onFrameEnded()

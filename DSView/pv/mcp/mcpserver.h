@@ -44,6 +44,13 @@ public:
     quint16 listenPort() const { return _server.serverPort(); }
     bool isListening() const { return _server.isListening(); }
 
+signals:
+    /* Emitted for every log-worthy event: server start/stop, client
+     * connect/disconnect, request received, response/error sent.
+     * Already prefixed with a "[hh:mm:ss]" timestamp. The log dialog
+     * (or any other observer) can listen and append. */
+    void logMessage(const QString &line);
+
 private slots:
     void onNewConnection();
     void onClientReadyRead();
@@ -54,6 +61,7 @@ private slots:
 
 private:
     void handleLine(QTcpSocket *sock, const QByteArray &line);
+    void log(const QString &text);
     void writeResponse(QTcpSocket *sock,
                        const QJsonValue &id,
                        const QJsonObject &result);
