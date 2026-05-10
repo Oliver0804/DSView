@@ -359,6 +359,8 @@ def capture(
     trigger_edge: str | None = None,
     trigger_pos_pct: int | None = None,
     trigger_pattern: dict[str, str] | str | None = None,
+    trigger_holdoff_ns: int | None = None,
+    trigger_margin: int | None = None,
 ) -> dict[str, Any]:
     """Run a single logic capture on the selected device. **Two-step**.
 
@@ -414,6 +416,11 @@ def capture(
                 {"3": "rising", "10": "high"}   # SPI CS edge while CLK high
              Wins over `trigger_channel`/`trigger_edge` when both are
              set. Channels not listed default to 'X' (don't care).
+        trigger_holdoff_ns: minimum interval (ns) before the trigger
+             is allowed to re-arm — tame chatty buses where one logical
+             event spans many edges. Driver default ≈ 0.
+        trigger_margin: jitter tolerance (0..255). Higher = looser
+             match. Driver default ≈ 8 — only touch if you see jitter.
 
     Example:
         >>> # Step 1: dry-run to inspect settings
@@ -483,6 +490,8 @@ def capture(
         "trigger_edge": trigger_edge,
         "trigger_pos_pct": trigger_pos_pct,
         "trigger_pattern": trigger_pattern_str,
+        "trigger_holdoff_ns": trigger_holdoff_ns,
+        "trigger_margin": trigger_margin,
     }
 
     if not confirm:
@@ -523,6 +532,8 @@ def capture(
         if trigger_edge:                   params["trigger_edge"]   = str(trigger_edge)
         if trigger_pos_pct is not None:    params["trigger_pos_pct"] = int(trigger_pos_pct)
         if trigger_pattern_str:            params["trigger_pattern"] = trigger_pattern_str
+        if trigger_holdoff_ns is not None: params["trigger_holdoff_ns"] = int(trigger_holdoff_ns)
+        if trigger_margin is not None:     params["trigger_margin"]    = int(trigger_margin)
 
         daemon_attempted = True
         try:
@@ -577,6 +588,10 @@ def capture(
             args += ["--trigger-pos", str(int(trigger_pos_pct))]
         if trigger_pattern_str:
             args += ["--trigger-pattern", trigger_pattern_str]
+        if trigger_holdoff_ns is not None:
+            args += ["--trigger-holdoff", str(int(trigger_holdoff_ns))]
+        if trigger_margin is not None:
+            args += ["--trigger-margin", str(int(trigger_margin))]
 
         _run_helper(args, timeout=timeout_sec + 30)
     elapsed = time.time() - t0
@@ -630,6 +645,12 @@ def capture(
                 spawn_args += ["--trigger-pos", str(int(trigger_pos_pct))]
             if trigger_pattern_str:
                 spawn_args += ["--trigger-pattern", trigger_pattern_str]
+            if trigger_holdoff_ns is not None:
+                spawn_args += ["--trigger-holdoff",
+                               str(int(trigger_holdoff_ns))]
+            if trigger_margin is not None:
+                spawn_args += ["--trigger-margin",
+                               str(int(trigger_margin))]
             _run_helper(spawn_args, timeout=timeout_sec + 30)
             cap = _load_capture(cap_id)
         except HelperError as e:
@@ -647,7 +668,7 @@ def capture(
         except Exception:
             pass
 
-    return {
+    out: dict[str, Any] = {
         "capture_id": cap_id,
         "samples": cap.samples,
         "samplerate": cap.samplerate,
@@ -655,6 +676,12 @@ def capture(
         "channels": cap.channel_indices,
         "name": name,
     }
+    # Surface trigger_position_sample so LLM can scope decode/read_window
+    # to a small window around the trigger point instead of the full buffer.
+    if cap.meta.get("trigger_enabled"):
+        out["trigger_position_sample"] = cap.meta.get("trigger_position_sample")
+        out["trigger_position_pct"]    = cap.meta.get("trigger_position_pct")
+    return out
 
 
 @mcp.tool()
@@ -772,6 +799,7 @@ def read_window(
     channel: int,
     start_sample: int = 0,
     length: int = 128,
+    around_trigger_us: float | None = None,
 ) -> dict[str, Any]:
     """Read raw bits for a small window of a channel.
 
@@ -783,6 +811,11 @@ def read_window(
             — this prints one '0'/'1' character per sample, so length=4096
             costs ~1k tokens. Use `analyze` for whole-channel stats and only
             reach for `read_window` when you need to eyeball a transition.
+        around_trigger_us: if the capture was triggered, ignore
+            `start_sample` and `length` and read ±N/2 µs centred on
+            the trigger point instead. Capped at MAX_WINDOW_SAMPLES
+            (4096). Saves the LLM the math of converting trigger
+            position into sample indices.
 
     Returns:
         {"bits": str of '0'/'1', "start_sample": int, "end_sample": int,
@@ -800,6 +833,14 @@ def read_window(
 
     cap = _load_capture(capture_id)
     bits = cap.channel_bits(channel)
+
+    if around_trigger_us and cap.meta.get("trigger_enabled"):
+        pos = int(cap.meta.get("trigger_position_sample") or 0)
+        half = int(float(around_trigger_us) * 1e-6 * cap.samplerate * 0.5)
+        half = min(half, MAX_WINDOW_SAMPLES // 2)
+        start_sample = max(0, pos - half)
+        length = min(2 * half, MAX_WINDOW_SAMPLES)
+
     end = min(start_sample + length, bits.size)
     if start_sample >= bits.size:
         return {"error": "start_sample beyond capture end",
@@ -930,6 +971,24 @@ def _summarize_annotations(anns: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
+def _resolve_trigger_window(cap: "Capture",
+                            around_trigger_us: float | None,
+                            start_sample: int,
+                            end_sample: int) -> tuple[int, int]:
+    """Translate `around_trigger_us=N` into start/end sample indices
+    centered on the capture's recorded trigger position. Falls back to
+    the explicit start/end_sample when no trigger or no window asked."""
+    if around_trigger_us is None or around_trigger_us <= 0:
+        return start_sample, end_sample
+    if not cap.meta.get("trigger_enabled"):
+        return start_sample, end_sample
+    pos = int(cap.meta.get("trigger_position_sample") or 0)
+    half = int(float(around_trigger_us) * 1e-6 * cap.samplerate * 0.5)
+    s = max(0, pos - half)
+    e = min(cap.samples, pos + half)
+    return s, e
+
+
 @mcp.tool()
 def decode(
     capture_id: str,
@@ -941,6 +1000,7 @@ def decode(
     limit: int = 5000,
     output: str = "summary",
     stack: list[str] | str | None = None,
+    around_trigger_us: float | None = None,
 ) -> dict[str, Any]:
     """Run a protocol decoder over a captured logic trace.
 
@@ -974,6 +1034,12 @@ def decode(
                        - spi → "spiflash" (xx25 SPI flash chips)
                        - spi → "sdcard_spi"
                        - uart → "modbus"
+        around_trigger_us: when the capture was triggered, decode
+                     only ±N/2 µs around the trigger point. Saves a
+                     huge amount of tokens — e.g. on a 1MS/s × 200ms
+                     capture, around_trigger_us=2000 trims the window
+                     from 200 000 to 2 000 samples. Ignored when the
+                     capture has no trigger position.
 
     Returns (output="summary"):
         {"protocol": str, "samplerate": int, "window_samples": int,
@@ -1005,6 +1071,9 @@ def decode(
     cap = _load_capture(capture_id)
     bin_path = cap.bin_path
     prefix = str(bin_path)[:-4]  # strip ".bin"
+
+    start_sample, end_sample = _resolve_trigger_window(
+        cap, around_trigger_us, start_sample, end_sample)
 
     args = [
         "decode",

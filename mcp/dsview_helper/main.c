@@ -363,6 +363,12 @@ struct capture_opts {
      * 16-channel device), rightmost → probe 0. NULL = use the simple
      * trigger_channel/edge above instead. */
     const char *trigger_pattern;
+    /* Trigger holdoff in nanoseconds — minimum interval before the
+     * next match is allowed. -1 = leave at driver default. */
+    long long trigger_holdoff_ns;
+    /* Trigger margin (jitter tolerance, driver-specific 0..255).
+     * -1 = leave at driver default. */
+    int trigger_margin;
 };
 
 static int cmd_capture(int index, const char *output_prefix,
@@ -584,6 +590,26 @@ static int cmd_capture(int index, const char *output_prefix,
                 && opts->trigger_pos_pct <= 100) {
                 ds_trigger_set_pos((uint16_t)opts->trigger_pos_pct);
             }
+            if (opts->trigger_holdoff_ns >= 0) {
+                GVariant *gv = g_variant_new_uint64(
+                    (uint64_t)opts->trigger_holdoff_ns);
+                rc = ds_set_actived_device_config(
+                    NULL, NULL, SR_CONF_TRIGGER_HOLDOFF, gv);
+                if (rc != SR_OK)
+                    fprintf(stderr,
+                        "warning: set trigger_holdoff=%lld ns failed (%s)\n",
+                        opts->trigger_holdoff_ns, sr_error_str(rc));
+            }
+            if (opts->trigger_margin >= 0 && opts->trigger_margin <= 255) {
+                GVariant *gv = g_variant_new_byte(
+                    (uint8_t)opts->trigger_margin);
+                rc = ds_set_actived_device_config(
+                    NULL, NULL, SR_CONF_TRIGGER_MARGIN, gv);
+                if (rc != SR_OK)
+                    fprintf(stderr,
+                        "warning: set trigger_margin=%d failed (%s)\n",
+                        opts->trigger_margin, sr_error_str(rc));
+            }
         }
     }
 
@@ -703,6 +729,9 @@ static int cmd_capture(int index, const char *output_prefix,
         "\"enabled_indices\":\"%s\","
         "\"active_device_name\":\"%s\","
         "\"active_device_handle\":%llu,"
+        "\"trigger_enabled\":%s,"
+        "\"trigger_position_pct\":%u,"
+        "\"trigger_position_sample\":%" PRIu64 ","
         "\"atomic_samples\":64,"
         "\"atomic_bytes_per_channel\":8,"
         "\"bytes\":%" PRIu64 ","
@@ -715,6 +744,10 @@ static int cmd_capture(int index, const char *output_prefix,
         enabled_csv->str,
         actual_name,
         (unsigned long long)actual_handle,
+        ds_trigger_get_en() ? "true" : "false",
+        (unsigned)ds_trigger_get_pos(),
+        (uint64_t)((double)actual_samples
+                   * (double)ds_trigger_get_pos() / 100.0),
         g.bytes_written);
     g_string_free(enabled_csv, TRUE);
     int first = 1;
@@ -997,6 +1030,11 @@ static int cmd_daemon(int bind_index,
                 .trigger_edge    = 'X',
                 .trigger_pos_pct = (int)json_get_int(line,
                                                      "trigger_pos_pct", -1),
+                .trigger_pattern = NULL,
+                .trigger_holdoff_ns = json_get_int(line,
+                                                   "trigger_holdoff_ns", -1),
+                .trigger_margin = (int)json_get_int(line,
+                                                    "trigger_margin", -1),
             };
             char max_height[32]; char trigger_edge_w[16];
             char trigger_pattern[128];
@@ -1076,6 +1114,8 @@ int main(int argc, char **argv)
         .trigger_edge   = 'X',
         .trigger_pos_pct = -1,
         .trigger_pattern = NULL,
+        .trigger_holdoff_ns = -1,
+        .trigger_margin = -1,
     };
     long long start_sample = 0;
     long long end_sample = 0;
@@ -1102,6 +1142,8 @@ int main(int argc, char **argv)
         {"trigger-pos",     required_argument, 0, 1011},
         {"bind-index",      required_argument, 0, 1012},
         {"trigger-pattern", required_argument, 0, 1014},
+        {"trigger-holdoff", required_argument, 0, 1015},
+        {"trigger-margin",  required_argument, 0, 1016},
         {"firmware",     required_argument, 0, 'f'},
         {"user-data",    required_argument, 0, 'u'},
         {"protocol",     required_argument, 0, 'P'},
@@ -1159,6 +1201,8 @@ int main(int argc, char **argv)
         case 1012: bind_index = atoi(optarg); break;
         case 1013: stack       = optarg;       break;
         case 1014: opts.trigger_pattern = optarg; break;
+        case 1015: opts.trigger_holdoff_ns = strtoll(optarg, NULL, 10); break;
+        case 1016: opts.trigger_margin     = atoi(optarg); break;
         case 'f': firmware   = optarg;       break;
         case 'u': user_data  = optarg;       break;
         case 'P': protocol   = optarg;       break;
