@@ -369,7 +369,10 @@ static int cmd_capture(int index, const char *output_prefix,
     /* Snapshot the device list *before* activation so we can verify the
      * activate request actually landed on the slot we asked for. USB
      * exclusivity races can leave libsigrok with a different active
-     * device than expected (open fails internally, lib falls back). */
+     * device than expected (open fails internally, lib falls back).
+     * Two same-name Plus units are common in the wild, so the post-
+     * activation check must compare handle, not just name. */
+    ds_device_handle expected_handle = NULL_HANDLE;
     char expected_name[150] = {0};
     {
         ds_reload_device_list();
@@ -377,6 +380,7 @@ static int cmd_capture(int index, const char *output_prefix,
         int count = 0;
         if (ds_get_device_list(&arr, &count) == SR_OK && arr && index >= 0
                 && index < count) {
+            expected_handle = arr[index].handle;
             strncpy(expected_name, arr[index].name,
                     sizeof(expected_name) - 1);
         }
@@ -390,17 +394,23 @@ static int cmd_capture(int index, const char *output_prefix,
 
     /* Verify what we actually got (kept in scope for metadata below). */
     static char actual_name[150];
+    static ds_device_handle actual_handle;
     actual_name[0] = '\0';
+    actual_handle = NULL_HANDLE;
     {
         struct ds_device_full_info dinfo; memset(&dinfo, 0, sizeof(dinfo));
         ds_get_actived_device_info(&dinfo);
+        actual_handle = dinfo.handle;
         strncpy(actual_name, dinfo.name, sizeof(actual_name) - 1);
     }
-    if (expected_name[0] && strcmp(expected_name, actual_name) != 0) {
-        emit_error("active-device mismatch: requested index=%d (%s) but "
-                   "lib activated %s — likely USB exclusion (another "
-                   "process is holding the device)",
-                   index, expected_name, actual_name);
+    if (expected_handle != NULL_HANDLE && expected_handle != actual_handle) {
+        emit_error("active-device mismatch: requested index=%d (handle "
+                   "%llu, %s) but lib activated handle %llu (%s) — "
+                   "likely USB exclusion (another process is holding "
+                   "the device)",
+                   index,
+                   (unsigned long long)expected_handle, expected_name,
+                   (unsigned long long)actual_handle, actual_name);
         return 1;
     }
 
@@ -622,6 +632,7 @@ static int cmd_capture(int index, const char *output_prefix,
         "\"enabled_channels\":%d,"
         "\"enabled_indices\":\"%s\","
         "\"active_device_name\":\"%s\","
+        "\"active_device_handle\":%llu,"
         "\"atomic_samples\":64,"
         "\"atomic_bytes_per_channel\":8,"
         "\"bytes\":%" PRIu64 ","
@@ -633,6 +644,7 @@ static int cmd_capture(int index, const char *output_prefix,
         layout, enabled_logic,
         enabled_csv->str,
         actual_name,
+        (unsigned long long)actual_handle,
         g.bytes_written);
     g_string_free(enabled_csv, TRUE);
     int first = 1;
