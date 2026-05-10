@@ -596,6 +596,7 @@ def list_decoders(
 _BIT_LEVEL_LABELS = {
     "miso-bits", "mosi-bits", "data-bits", "bit",
     "address-read", "address-write",  # i2c also emits these as bit-level pairs
+    "stuff-bit",                       # CAN / CAN-FD bit-stuffing markers
     "warnings",  # noisy and rarely actionable for high-level summary
 }
 

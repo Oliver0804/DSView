@@ -240,6 +240,17 @@ Demo Device 有兩種訊號模式：
 
 `dsview-mcp` 啟動時會自動把 repo 內的 `DSView/demo/` symlink 到 `~/.dsview/demo/`，所以 demo 一律走 protocol pattern。如果要重置回 random，刪掉 symlink 即可：`rm ~/.dsview/demo`。
 
+**Demo Device 必須啟全 16 ch**：`.demo` 檔內部是 fixed 16-channel atomic-block layout，driver 不會依 enabled count 重新 pack。只啟用部分 channel 會導致 atomic-block 內 slot 對應錯位，decoder 解不出資料（或拿到位移過的訊號）。實體 DSLogic 沒這個限制 — driver 真的會依 enabled 動態 pack。
+
+對應的 channel 對照（demo `protocol.demo`）：
+
+| Channel | 內容 |
+|---|---|
+| ch0, ch1 | I²C (sda=0, scl=1) — 24xx EEPROM `Sequential random read` |
+| ch5 | UART RX/TX |
+| ch9 | CAN-FD |
+| ch12-15 | SPI (clk=12, cs#=13, mosi=14, miso=15) — SSDP/UPnP `M-SEARCH` |
+
 ### 已知限制
 
 - **觸發條件**未支援（v3 預留）

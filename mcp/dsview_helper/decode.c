@@ -397,6 +397,20 @@ int cmd_decode(const char *input_prefix,
         g_free(dup);
         int en_count = (int)en->len;
         size_t block_bytes = (size_t)atom_bytes * (size_t)en_count;
+        /* The cross slice must be wide enough to hold every enabled channel
+         * at its raw index — e.g. enabling only ch 12-15 still needs
+         * unitsize=2 because we drop the bit at byte (ch/8). The capture's
+         * recorded unitsize is computed from enabled_count, which is too
+         * small for sparse-high enable sets, so re-derive it from max ch. */
+        int max_ch = -1;
+        for (int i = 0; i < en_count; i++) {
+            int v = g_array_index(en, int, i);
+            if (v > max_ch) max_ch = v;
+        }
+        int needed_unitsize = (max_ch >= 0) ? (max_ch / 8 + 1) : 1;
+        if (needed_unitsize > unitsize)
+            unitsize = needed_unitsize;
+
         if (en_count > 0 && block_bytes > 0) {
             size_t n_blocks = bin_len / block_bytes;
             size_t cross_bytes = n_blocks * (size_t)atom_samples
