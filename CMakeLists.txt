@@ -663,6 +663,16 @@ endif()
 message(STATUS "Output dir: ${CMAKE_CURRENT_SOURCE_DIR}/build.dir")
 set(EXECUTABLE_OUTPUT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/build.dir")
 
+# The virtual-demo driver looks for its .demo pattern files relative to
+# DS_USR_PATH (the binary's directory in dev builds). Symlink the demo
+# tree alongside the binary so the Demo Device picks up the bundled
+# protocol pattern instead of falling back to PATTERN_RANDOM.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E create_symlink
+        "${CMAKE_CURRENT_SOURCE_DIR}/DSView/demo"
+        "${EXECUTABLE_OUTPUT_PATH}/demo"
+    COMMENT "Symlinking demo patterns to ${EXECUTABLE_OUTPUT_PATH}/demo")
+
 #===============================================================================
 #= Installation
 #-------------------------------------------------------------------------------
