@@ -61,6 +61,17 @@ WORKDIR = Path(os.environ.get(
 WORKDIR.mkdir(parents=True, exist_ok=True)
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# Make the bundled demo patterns available to the virtual-demo driver.
+# Without this the driver falls back to random sample data, which makes
+# Demo Device captures useless for testing protocol decoders.
+_DEMO_LINK = USER_DATA_DIR / "demo"
+_DEMO_SOURCE = REPO_ROOT / "DSView" / "demo"
+if not _DEMO_LINK.exists() and _DEMO_SOURCE.is_dir():
+    try:
+        _DEMO_LINK.symlink_to(_DEMO_SOURCE)
+    except OSError:
+        pass
+
 mcp = FastMCP("dsview")
 
 # Hard caps to keep MCP responses small.
@@ -220,14 +231,23 @@ def list_devices() -> dict[str, Any]:
 
 
 @mcp.tool()
-def device_info(index: int = -1) -> dict[str, Any]:
+def device_info(index: int = -1, include_disabled: bool = False) -> dict[str, Any]:
     """Get info about a device (channels, current samplerate, depth).
 
     Args:
         index: device index from list_devices (-1 = last attached).
+        include_disabled: include disabled channels in the listing
+            (default False — most devices expose 16 channels but only a
+            handful are enabled, dropping the rest saves ~70% of tokens).
     """
     res = _run_helper(["device-info", "--index", str(index)], timeout=15)
     res.pop("ok", None)
+    if not include_disabled:
+        res["channels"] = [c for c in res.get("channels", [])
+                           if c.get("enabled")]
+    # type=10000 is SR_CHANNEL_LOGIC for every channel here; drop the noise.
+    for c in res.get("channels", []):
+        c.pop("type", None)
     return res
 
 
@@ -344,7 +364,7 @@ def capture(
                      "again with confirm=True to run the actual acquisition."),
         }
 
-    cap_id = uuid.uuid4().hex[:10]
+    cap_id = uuid.uuid4().hex[:8]
     prefix = WORKDIR / f"cap-{cap_id}"
 
     args = [
@@ -385,11 +405,8 @@ def capture(
         "capture_id": cap_id,
         "samples": cap.samples,
         "samplerate": cap.samplerate,
-        "unitsize": cap.unitsize,
         "duration_s": round(elapsed, 3),
         "channels": cap.channel_indices,
-        "json_path": str(WORKDIR / f"cap-{cap_id}.json"),
-        "settings": settings,
     }
 
 
@@ -484,7 +501,7 @@ def read_window(
     capture_id: str,
     channel: int,
     start_sample: int = 0,
-    length: int = 256,
+    length: int = 128,
 ) -> dict[str, Any]:
     """Read raw bits for a small window of a channel.
 
@@ -492,10 +509,14 @@ def read_window(
         capture_id: id from `capture`.
         channel: channel index.
         start_sample: first sample index (0-based).
-        length: number of samples (capped at 4096).
+        length: number of samples (default 128, capped at 4096). Keep small
+            — this prints one '0'/'1' character per sample, so length=4096
+            costs ~1k tokens. Use `analyze` for whole-channel stats and only
+            reach for `read_window` when you need to eyeball a transition.
 
     Returns:
-        {"bits": str of '0'/'1', "start_sample": int, "samplerate": int}
+        {"bits": str of '0'/'1', "start_sample": int, "end_sample": int,
+         "samplerate": int}
     """
     if length <= 0:
         return {"error": "length must be > 0"}
@@ -510,7 +531,6 @@ def read_window(
 
     window = bits[start_sample:end]
     return {
-        "capture_id": capture_id,
         "channel": channel,
         "start_sample": start_sample,
         "end_sample": int(end),
@@ -520,23 +540,43 @@ def read_window(
 
 
 @mcp.tool()
-def list_decoders(filter_substring: str | None = None) -> dict[str, Any]:
+def list_decoders(
+    filter_substring: str | None = None,
+    detail: bool = False,
+) -> dict[str, Any]:
     """List available protocol decoders (i2c, spi, uart, ...).
 
+    There are 150+ bundled decoders, so the unfiltered + detailed listing is
+    enormous (~20k tokens). The default returns just `{id, name}` pairs and
+    refuses to enumerate everything when no filter is given — supply a
+    `filter_substring` first.
+
     Args:
-        filter_substring: optional case-insensitive filter on id/name.
+        filter_substring: case-insensitive substring on id/name. **Required
+            unless detail=True is also explicitly set.**
+        detail: include channel ids and option ids per decoder. Defaults to
+            False to save context; flip on once you've narrowed down to a
+            decoder you actually want to call.
 
     Returns:
-        {"decoders": [
-            {"id": str, "name": str, "longname": str, "desc": str,
-             "channels": [{"id": str, "name": str, "required": bool}, ...],
-             "options":  [{"id": str, "desc": str}, ...]},
-            ...
-        ]}
+        compact (default):
+            {"decoders": [{"id": str, "name": str}, ...], "count": int}
+        detail=True:
+            {"decoders": [
+                {"id", "name", "longname",
+                 "channels": [{"id", "name", "required"}, ...],
+                 "options":  [{"id", "desc"}, ...]}, ...]}
 
     The DSL fork uses ids like "0:uart" / "1:uart" (two flavours of the
     same protocol). The `id` field is what you pass to `decode(protocol=...)`.
     """
+    if not filter_substring and not detail:
+        return {
+            "error": "Pass a filter_substring (e.g. 'i2c', 'spi', 'uart') "
+                     "or detail=True. Listing all 150+ decoders compactly "
+                     "is allowed via filter_substring='', but unfiltered + "
+                     "detail is intentionally blocked to save context.",
+        }
     res = _run_helper(["list-decoders"], timeout=30)
     decoders = res.get("decoders", [])
     if filter_substring:
@@ -547,7 +587,49 @@ def list_decoders(filter_substring: str | None = None) -> dict[str, Any]:
             or s in d.get("name", "").lower()
             or s in d.get("longname", "").lower()
         ]
+    if not detail:
+        decoders = [{"id": d["id"], "name": d.get("name", d["id"])}
+                    for d in decoders]
     return {"decoders": decoders, "count": len(decoders)}
+
+
+_BIT_LEVEL_LABELS = {
+    "miso-bits", "mosi-bits", "data-bits", "bit",
+    "address-read", "address-write",  # i2c also emits these as bit-level pairs
+    "warnings",  # noisy and rarely actionable for high-level summary
+}
+
+
+def _summarize_annotations(anns: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collapse a fat annotation list into a token-cheap summary.
+
+    Groups same-label data annotations into hex byte streams (for SPI/I2C/UART
+    style protocols) and keeps non-bit-level events as compact triplets so the
+    LLM can still see Start / Stop / framing.
+    """
+    streams: dict[str, list[str]] = {}
+    events: list[dict[str, Any]] = []
+    for a in anns:
+        label = a.get("label", "ann")
+        if label in _BIT_LEVEL_LABELS:
+            continue
+        hex_v = a.get("hex")
+        if hex_v:
+            streams.setdefault(label, []).append(hex_v)
+            continue
+        # Compact event form: [start_sample, label, text_or_empty]
+        text = a.get("text") or []
+        events.append({
+            "s": a["start"],
+            "l": label,
+            "t": text[0] if text else "",
+        })
+    out: dict[str, Any] = {}
+    if streams:
+        out["streams"] = {k: " ".join(v) for k, v in streams.items()}
+    if events:
+        out["events"] = events
+    return out
 
 
 @mcp.tool()
@@ -559,27 +641,40 @@ def decode(
     start_sample: int = 0,
     end_sample: int = 0,
     limit: int = 5000,
+    output: str = "summary",
 ) -> dict[str, Any]:
     """Run a protocol decoder over a captured logic trace.
+
+    The decoder may emit thousands of fine-grained bit-level annotations
+    (e.g. SPI emits 8 miso-bit + 8 mosi-bit + miso-data + mosi-data per
+    transferred byte — 18 entries each), which blows up the LLM context.
+    The default `output="summary"` collapses those into one hex byte stream
+    per data lane plus a short list of framing events.
 
     Args:
         capture_id: id from `capture` or `list_captures`.
         protocol:   decoder id from `list_decoders`, e.g. "0:i2c", "0:uart".
-        channel_map: decoder channel id -> logic channel index from the
-                     capture, e.g. {"scl": 0, "sda": 1}.
-                     Use `list_decoders` to discover the required channel ids.
+        channel_map: decoder channel id -> logic channel index, e.g.
+                     {"scl": 0, "sda": 1}. **You can re-call decode() with
+                     a different mapping if the result looks wrong — no need
+                     to re-capture.**
         options:    decoder options keyed by id, e.g.
-                     {"baudrate": 9600, "num_data_bits": 8, "parity_type": "none"}.
+                     {"baudrate": 9600, "num_data_bits": 8}.
         start_sample / end_sample: inclusive/exclusive sample window
                      (0 = whole capture).
-        limit:      max number of annotations returned (default 5000).
+        limit:      max raw annotations to read from helper (default 5000).
+        output:     "summary" (default, ~100x cheaper) or "raw" (every
+                     annotation including bit-level entries).
 
-    Returns:
+    Returns (output="summary"):
         {"protocol": str, "samplerate": int, "window_samples": int,
-         "annotations": [
-             {"start": int, "end": int, "class": int, "label": str,
-              "text": [str, ...], "hex": str?}, ...
-         ],
+         "raw_count": int, "truncated": bool,
+         "streams": {"<label>": "AB CD EF ..."},   # hex byte streams
+         "events":  [{"s": sample, "l": label, "t": text}, ...]}
+
+    Returns (output="raw"):
+        {"protocol": str, "samplerate": int, "window_samples": int,
+         "annotations": [{"start", "end", "class", "label", "text", "hex"?}],
          "count": int, "truncated": bool}
     """
     cap = _load_capture(capture_id)
@@ -602,7 +697,20 @@ def decode(
 
     res = _run_helper(args, timeout=120)
     res.pop("ok", None)
-    return res
+
+    if output == "raw":
+        return res
+
+    anns = res.get("annotations", [])
+    summary = _summarize_annotations(anns)
+    return {
+        "protocol":       res.get("protocol", protocol),
+        "samplerate":     res.get("samplerate"),
+        "window_samples": res.get("window_samples"),
+        "raw_count":      res.get("count", len(anns)),
+        "truncated":      res.get("truncated", False),
+        **summary,
+    }
 
 
 def main() -> None:

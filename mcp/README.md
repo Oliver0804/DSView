@@ -194,12 +194,58 @@ DreamSourceLab 的解碼器使用 `0:` 與 `1:` 前綴（兩個版本：upstream
 
 完整列表用 `list_decoders()` 拉。
 
+### Context-saving（讓 LLM 對話省 token）
+
+每個 tool 都做過 token 精簡，重要 default 行為：
+
+| Tool | 行為 |
+|---|---|
+| `decode(...)` | 預設 `output="summary"` — 把 SPI/I²C/UART 的 bit-level annotations（每 byte 18 條）摺成 hex byte stream。**SPI 16 byte：41,000 tokens → 200 tokens（99% 節省）**。需要 raw annotation 才指定 `output="raw"` |
+| `list_decoders` | 預設 compact 只回 `{id, name}` pair；`detail=True` 才連 channels/options 一起回。`filter_substring` 跟 `detail` 兩個都不指定會 error，避免一次拉 150+ decoder |
+| `device_info` | 預設只回 enabled channels；要全部用 `include_disabled=True` |
+| `read_window` | 預設 length 從 256 → 128。length=4096 會花 ~1k tokens，避免亂用 |
+| `capture(confirm=True)` | 不再 echo 完整 settings dict（你自己傳的，沒必要再回來）。回 `capture_id`、samples、channels 就夠 |
+
+實測一個典型 SPI workflow（list_devices → capture preview → capture confirm → list_decoders → decode）：
+- 之前：~16,400 tokens
+- 之後：~550 tokens（**節省 30 倍**）
+
+### LLM 自己迭代 channel_map（重要技巧）
+
+`decode(...)` 的 `channel_map` 是 LLM 動態指定的 — 沒解出合理 byte 時直接重新呼叫即可，**不必重新採集**：
+
+```python
+# 第一次：先猜
+decode(capture_id="...", protocol="1:spi",
+       channel_map={"clk":12, "cs":13, "mosi":14, "miso":15})
+# → 0 個 annotation 或都是 frame error？
+
+# 看一下波形
+read_window(capture_id="...", channel=12, length=200)  # 找誰是 clock
+analyze(capture_id="...", channel=12)                  # 找誰 edge 多
+
+# 換 mapping 重 decode（之前的 capture 還在）
+decode(... channel_map={"clk":12, "cs":13, "mosi":15, "miso":14})  # swap
+# 或試不同 cpol / cpha / cs_polarity 組合
+```
+
+採集是真正的「副作用」（佔住硬體、寫盤），decode 是讀檔 — 反覆試 mapping / 解碼參數成本很低，這是 LLM 預期用法。
+
+### Demo Device 的 protocol pattern
+
+Demo Device 有兩種訊號模式：
+
+- **Random**（fallback）：`rand()` 生成的偽隨機 16-channel 雜訊，看不出 i2c/uart/spi
+- **Protocol pattern**：載入 `~/.dsview/demo/logic/protocol.demo`，產生 GUI 上看到的完整 i2c / uart / spi / can-fd 訊號（最長 ~5.24ms 視窗）
+
+`dsview-mcp` 啟動時會自動把 repo 內的 `DSView/demo/` symlink 到 `~/.dsview/demo/`，所以 demo 一律走 protocol pattern。如果要重置回 random，刪掉 symlink 即可：`rm ~/.dsview/demo`。
+
 ### 已知限制
 
 - **觸發條件**未支援（v3 預留）
 - **連續串流**未支援
 - 載入/儲存 `.dsl` session 檔未支援
-- 多解碼器堆疊（stacked decoders，例如 spi → spiflash）未支援
+- 多解碼器堆疊（stacked decoders，例如 spi → spiflash、i2c → 24xx EEPROM）未支援
 - DSLogic Plus 的 vth 上限約 1.98V（pid 0x0020 此版 firmware）
 - 採集中 helper 是同步 block，timeout 預設 30s。長採集請拉高 `timeout_sec`
 
