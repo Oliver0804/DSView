@@ -350,6 +350,13 @@ struct capture_opts {
     int    ext_clock;          /* 0/1 (external sample clock) */
     int    falling_edge;       /* 0/1 (sample on falling clock edge) */
     const char *max_height;    /* "1X", "2X", etc. */
+    /* Simple trigger (single-stage, single-probe). DSLogic only fires
+     * triggers in Buffer mode; the helper auto-flips OPERATION_MODE if
+     * a trigger is requested but the device is currently in Stream. */
+    int    trigger_channel;    /* probe index, -1 = no trigger */
+    char   trigger_edge;       /* 'R' rise | 'F' fall | 'C' either |
+                                * '1' high | '0' low | 'X' off       */
+    int    trigger_pos_pct;    /* 0..100 (pre-trigger %), -1 = default */
 };
 
 static int cmd_capture(int index, const char *output_prefix,
@@ -514,6 +521,29 @@ static int cmd_capture(int index, const char *output_prefix,
             if (rc != SR_OK)
                 fprintf(stderr, "warning: set max_height=%s failed (%s)\n",
                         opts->max_height, sr_error_str(rc));
+        }
+
+        /* Simple trigger setup. DSLogic only honours triggers in Buffer
+         * mode, so auto-flip OPERATION_MODE if the caller asked for a
+         * trigger but didn't explicitly choose Buffer. Stream mode just
+         * silently drops the trigger config otherwise. */
+        if (opts->trigger_channel >= 0 && opts->trigger_edge != 'X') {
+            if (opts->operation_mode < 0) {
+                GVariant *gv = g_variant_new_int16(0); /* LO_OP_BUFFER */
+                ds_set_actived_device_config(NULL, NULL,
+                                             SR_CONF_OPERATION_MODE, gv);
+                fprintf(stderr,
+                        "info: trigger requested — auto-set Buffer mode\n");
+            }
+            ds_trigger_reset();
+            ds_trigger_probe_set((uint16_t)opts->trigger_channel,
+                                 (unsigned char)opts->trigger_edge,
+                                 'X');
+            ds_trigger_set_en(1);
+            if (opts->trigger_pos_pct >= 0
+                && opts->trigger_pos_pct <= 100) {
+                ds_trigger_set_pos((uint16_t)opts->trigger_pos_pct);
+            }
         }
     }
 
@@ -721,6 +751,9 @@ int main(int argc, char **argv)
         .ext_clock      = -1,
         .falling_edge   = -1,
         .max_height     = NULL,
+        .trigger_channel = -1,
+        .trigger_edge   = 'X',
+        .trigger_pos_pct = -1,
     };
     long long start_sample = 0;
     long long end_sample = 0;
@@ -742,6 +775,9 @@ int main(int argc, char **argv)
         {"ext-clock",      required_argument, 0, 1006},
         {"falling-edge",   required_argument, 0, 1007},
         {"max-height",     required_argument, 0, 1008},
+        {"trigger-channel", required_argument, 0, 1009},
+        {"trigger-edge",    required_argument, 0, 1010},
+        {"trigger-pos",     required_argument, 0, 1011},
         {"firmware",     required_argument, 0, 'f'},
         {"user-data",    required_argument, 0, 'u'},
         {"protocol",     required_argument, 0, 'P'},
@@ -778,6 +814,23 @@ int main(int argc, char **argv)
         case 1006: opts.ext_clock      = atoi(optarg); break;
         case 1007: opts.falling_edge   = atoi(optarg); break;
         case 1008: opts.max_height     = optarg;       break;
+        case 1009: opts.trigger_channel = atoi(optarg); break;
+        case 1010: {
+            char c = optarg[0];
+            /* Accept either single-char encoding ('R'/'F'/'C'/'1'/'0')
+             * or the user-friendly words used by the Python wrapper. */
+            if (c == 'R' || c == 'F' || c == 'C' || c == '1' || c == '0' ||
+                c == 'r' || c == 'f' || c == 'c') {
+                opts.trigger_edge = (c >= 'a' && c <= 'z') ? c - 32 : c;
+            } else if (!strcasecmp(optarg, "rising"))  opts.trigger_edge = 'R';
+            else if  (!strcasecmp(optarg, "falling")) opts.trigger_edge = 'F';
+            else if  (!strcasecmp(optarg, "either")
+                  ||  !strcasecmp(optarg, "edge"))    opts.trigger_edge = 'C';
+            else if  (!strcasecmp(optarg, "high"))    opts.trigger_edge = '1';
+            else if  (!strcasecmp(optarg, "low"))     opts.trigger_edge = '0';
+            break;
+        }
+        case 1011: opts.trigger_pos_pct = atoi(optarg); break;
         case 'f': firmware   = optarg;       break;
         case 'u': user_data  = optarg;       break;
         case 'P': protocol   = optarg;       break;

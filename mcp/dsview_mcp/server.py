@@ -317,6 +317,9 @@ def capture(
     max_height: str | None = None,
     confirm: bool = False,
     name: str | None = None,
+    trigger_channel: int | None = None,
+    trigger_edge: str | None = None,
+    trigger_pos_pct: int | None = None,
 ) -> dict[str, Any]:
     """Run a single logic capture on the selected device. **Two-step**.
 
@@ -357,6 +360,15 @@ def capture(
         name: free-form tag stored alongside the capture. Shows up in
              `list_captures` so you (and the LLM) can find this run
              later by name instead of the hex capture_id.
+        trigger_channel: probe to trigger on (0..N-1). Pair with
+             `trigger_edge`. Implies Buffer mode (auto-set if not
+             specified — DSLogic only fires triggers in Buffer mode).
+        trigger_edge: 'rising' | 'falling' | 'either' | 'high' | 'low'.
+             Capture starts when this condition is met on
+             trigger_channel. Omit / None disables the trigger.
+        trigger_pos_pct: 0..100 — fraction of the buffer kept *before*
+             the trigger fires (50 = half pre / half post). Default
+             leaves the device's current setting.
 
     Example:
         >>> # Step 1: dry-run to inspect settings
@@ -396,6 +408,9 @@ def capture(
         "falling_edge_clock": falling_edge_clock,
         "max_height": max_height,
         "name": name,
+        "trigger_channel": trigger_channel,
+        "trigger_edge": trigger_edge,
+        "trigger_pos_pct": trigger_pos_pct,
     }
 
     if not confirm:
@@ -438,6 +453,12 @@ def capture(
         args += ["--falling-edge", "1" if falling_edge_clock else "0"]
     if max_height:
         args += ["--max-height", max_height]
+    if trigger_channel is not None and trigger_channel >= 0:
+        args += ["--trigger-channel", str(int(trigger_channel))]
+    if trigger_edge:
+        args += ["--trigger-edge", str(trigger_edge)]
+    if trigger_pos_pct is not None:
+        args += ["--trigger-pos", str(int(trigger_pos_pct))]
 
     t0 = time.time()
     _run_helper(args, timeout=timeout_sec + 30)
