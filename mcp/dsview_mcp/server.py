@@ -738,40 +738,21 @@ def list_captures(limit: int = 20) -> dict[str, Any]:
     return {"captures": items, "workdir": str(WORKDIR)}
 
 
-@mcp.tool()
-def analyze(capture_id: str, channel: int) -> dict[str, Any]:
-    """Compute edge / pulse / frequency stats on a channel.
-
-    Args:
-        capture_id: id from `capture` or `list_captures`.
-        channel: channel index (0..N-1).
-
-    Example:
-        >>> analyze(capture_id="ab12cd34", channel=0)
-        {"samples": 200000, "samplerate": 1000000, "duration_s": 0.2,
-         "duty_cycle": 0.5, "edges": 4000, "rising_edges": 2000,
-         "falling_edges": 2000, "estimated_freq_hz": 10000.0,
-         "pulse_width_s": {"min": 5e-5, "median": 5e-5, ...}}
-    """
-    cap = _load_capture(capture_id)
+def _analyze_one(cap: "Capture", channel: int) -> dict[str, Any]:
+    """Single-channel statistics — shared by analyze() and analyze_all()."""
     bits = cap.channel_bits(channel)
     n = bits.size
     if n == 0:
-        return {"error": "empty capture"}
+        return {"channel": channel, "error": "empty capture"}
 
-    # Edges where the bit changes.
     diff = np.diff(bits.astype(np.int8))
     rising = np.flatnonzero(diff == 1)
     falling = np.flatnonzero(diff == -1)
     edges = np.sort(np.concatenate([rising, falling]))
 
     sr = cap.samplerate
-    duration_s = n / sr if sr else 0.0
-
     high_count = int(bits.sum())
     duty = (high_count / n) if n else 0.0
-
-    # Pulse widths between consecutive edges.
     pulse_widths_samples = np.diff(edges) if edges.size > 1 else np.array([])
     pulse_widths_s = pulse_widths_samples / sr if sr else pulse_widths_samples
 
@@ -786,7 +767,6 @@ def analyze(capture_id: str, channel: int) -> dict[str, Any]:
             "median": float(np.median(arr)),
         }
 
-    # Frequency estimate from rising-edge spacing.
     freq_hz = None
     if rising.size >= 2 and sr:
         period_samples = float(np.median(np.diff(rising)))
@@ -794,11 +774,10 @@ def analyze(capture_id: str, channel: int) -> dict[str, Any]:
             freq_hz = sr / period_samples
 
     return {
-        "capture_id": capture_id,
         "channel": channel,
         "samples": int(n),
         "samplerate": sr,
-        "duration_s": duration_s,
+        "duration_s": n / sr if sr else 0.0,
         "duty_cycle": duty,
         "high_samples": high_count,
         "low_samples": int(n - high_count),
@@ -807,6 +786,57 @@ def analyze(capture_id: str, channel: int) -> dict[str, Any]:
         "falling_edges": int(falling.size),
         "estimated_freq_hz": freq_hz,
         "pulse_width_s": _stats(pulse_widths_s),
+    }
+
+
+@mcp.tool()
+def analyze(capture_id: str,
+            channel: int | list[int] | None = None) -> dict[str, Any]:
+    """Compute edge / pulse / frequency stats. Accepts a single channel
+    index, a list of indices, or `None` (= every enabled channel).
+
+    Use the list / None form to avoid four tool-call round-trips when
+    you want a per-channel summary across the whole bus — saves both
+    latency and tokens.
+
+    Args:
+        capture_id: id from `capture` or `list_captures`.
+        channel: int (single channel), list[int] (specific channels),
+            or None (all enabled channels).
+
+    Example:
+        >>> analyze(capture_id="ab12cd34", channel=0)            # one ch
+        {"channel": 0, "samples": 200000, ...}
+
+        >>> analyze(capture_id="ab12cd34", channel=[0, 1, 2, 3])  # batch
+        {"capture_id": "ab12cd34", "samplerate": 1000000,
+         "channels": [
+            {"channel": 0, "duty_cycle": 0.5, "estimated_freq_hz": 1000.0, ...},
+            {"channel": 1, ...},
+            ...
+         ]}
+
+        >>> analyze(capture_id="ab12cd34")                      # all enabled
+    """
+    cap = _load_capture(capture_id)
+
+    # Single-channel request — keep the legacy flat shape.
+    if isinstance(channel, int):
+        out = _analyze_one(cap, channel)
+        out["capture_id"] = capture_id
+        return out
+
+    # Batch — list[int] or None for "all enabled".
+    if channel is None:
+        targets = list(cap.channel_indices)
+    else:
+        targets = [int(c) for c in channel]
+
+    return {
+        "capture_id": capture_id,
+        "samplerate": cap.samplerate,
+        "samples": cap.samples,
+        "channels": [_analyze_one(cap, c) for c in targets],
     }
 
 
