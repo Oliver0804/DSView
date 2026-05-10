@@ -21,7 +21,9 @@
 #include "../sigsession.h"
 #include "../deviceagent.h"
 #include "../mainwindow.h"
+#include "../storesession.h"
 #include "../toolbars/samplingbar.h"
+#include "../view/view.h"
 #include "../log.h"
 
 namespace pv {
@@ -571,6 +573,66 @@ QJsonObject McpServer::toolGetState(const QJsonObject &params, QString *err)
     r["mcp_listening"] = _server.isListening();
     r["mcp_port"]      = _server.serverPort();
     r["ok"] = true;
+    return r;
+}
+
+/* save_session({path?: string}) — write the current capture (samples +
+ * channel layout + decoder stack) to a .dsl file. If `path` is omitted
+ * we auto-name into the user's home dir, the same naming scheme the
+ * GUI's "Save" button uses. Blocks until the writer thread finishes. */
+QJsonObject McpServer::toolSaveSession(const QJsonObject &params,
+                                       QString *err)
+{
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    if (_session->is_working()) {
+        if (err) *err = "device is currently capturing; call run_stop "
+                        "first before saving";
+        return {};
+    }
+
+    /* Same precondition the GUI's on_save() enforces. */
+    bool have_data = false;
+    for (auto s : _session->get_signals()) {
+        Q_UNUSED(s);
+        have_data = true;
+        break;
+    }
+    if (!have_data) {
+        if (err) *err = "no captured data to save (run a capture first)";
+        return {};
+    }
+
+    StoreSession ss(_session);
+
+    QString path = params.value("path").toString();
+    if (path.isEmpty()) {
+        /* Auto-name: identical to MakeSaveFile(false) but stash result. */
+        path = ss.MakeSaveFile(false);
+    } else {
+        if (!path.endsWith(".dsl", Qt::CaseInsensitive))
+            path += ".dsl";
+        ss.SetFileName(path);
+    }
+
+    /* MainWindow implements ISessionDataGetter; the writer needs it for
+     * decoder annotations and view-bound metadata. */
+    if (_main_window)
+        ss.SetSessionDataGetter(_main_window);
+
+    _session->set_saving(true);
+    bool ok = ss.save_start();
+    if (ok) ss.wait();
+    _session->set_saving(false);
+
+    QJsonObject r;
+    r["ok"]   = ok;
+    r["path"] = path;
+    if (ok) {
+        QFileInfo fi(path);
+        r["bytes"] = (qint64)fi.size();
+    } else {
+        if (err) *err = ss.error();
+    }
     return r;
 }
 

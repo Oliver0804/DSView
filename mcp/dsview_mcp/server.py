@@ -737,9 +737,35 @@ def decode(
 # explaining how to enable it.
 
 import socket as _socket
+import subprocess as _subprocess
 
 _GUI_HOST = "127.0.0.1"
 _GUI_PORT = 7384
+
+# Where to find the DSView binary when launching it. Override with the
+# DSVIEW_BINARY env var; otherwise we try the dev build location next to
+# this checkout, then /Applications/DSView.app on macOS.
+_DSVIEW_BINARY_CANDIDATES = [
+    os.environ.get("DSVIEW_BINARY", ""),
+    str(REPO_ROOT / "build.dir" / "DSView"),
+    "/Applications/DSView.app/Contents/MacOS/DSView",
+]
+
+
+def _find_dsview_binary() -> str | None:
+    for p in _DSVIEW_BINARY_CANDIDATES:
+        if p and Path(p).is_file() and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _gui_is_listening() -> bool:
+    try:
+        _socket.create_connection((_GUI_HOST, _GUI_PORT),
+                                  timeout=0.5).close()
+        return True
+    except OSError:
+        return False
 
 
 def _gui_call(method: str, params: dict | None = None,
@@ -865,6 +891,7 @@ def gui_set_config(
     ext_clock: bool | None = None,
     falling_edge_clock: bool | None = None,
     max_height: str | None = None,
+    pattern_mode: str | None = None,
 ) -> dict[str, Any]:
     """Drive the 'Options' (設備選項) dialog and the samplerate/depth
     dropdowns in one call. Pass only the fields you want to change; the
@@ -882,12 +909,93 @@ def gui_set_config(
         ("rle", rle), ("ext_clock", ext_clock),
         ("falling_edge_clock", falling_edge_clock),
         ("max_height", max_height),
+        ("pattern_mode", pattern_mode),
     ):
         if v is not None:
             p[k] = v
     if not p:
         return {"ok": True, "applied": {}, "hint": "no fields specified"}
     return _gui_invoke("set_config", p)
+
+
+@mcp.tool()
+def gui_save_session(path: str | None = None) -> dict[str, Any]:
+    """Save the current GUI capture (samples + decoder stack + channel
+    layout) as a `.dsl` session file the user can re-open later in
+    DSView. Equivalent to clicking File → Save in the GUI but without
+    popping a dialog.
+
+    Args:
+        path: absolute output path. Auto-named into the user's home dir
+            (`<device>-<mode>-<timestamp>.dsl`) when omitted.
+
+    Returns:
+        {ok, path, bytes} — `path` is what was actually written, even
+        when the caller didn't supply one. Surface this to the user so
+        they know where to look.
+
+    Example:
+        >>> gui_save_session("/tmp/my_run.dsl")
+        {"ok": true, "path": "/tmp/my_run.dsl", "bytes": 248501}
+    """
+    p: dict[str, Any] = {}
+    if path: p["path"] = path
+    return _gui_invoke("save_session", p, timeout=60)
+
+
+@mcp.tool()
+def launch_gui(prefer_device: str = "demo",
+               wait_seconds: float = 8.0) -> dict[str, Any]:
+    """Spawn the DSView GUI app with the embedded MCP server enabled,
+    so subsequent `gui_*` calls can drive it. Returns once the server
+    is listening on 127.0.0.1:7384, or fails after `wait_seconds`.
+
+    Already-running GUI: returns immediately with {already_running: true}.
+
+    Args:
+        prefer_device: name substring of the device to land on at boot
+            ('demo' | 'dslogic' | 'dscope' | ''). 'demo' leaves any
+            attached USB DSLogic free for parallel stdio access.
+        wait_seconds: how long to wait for port 7384 to come up.
+
+    Example:
+        >>> launch_gui()                            # default: GUI on Demo
+        {"ok": true, "already_running": false, "pid": 12345, "port": 7384}
+        >>> launch_gui(prefer_device="dslogic")     # GUI grabs DSLogic
+    """
+    if _gui_is_listening():
+        return {"ok": True, "already_running": True, "port": _GUI_PORT}
+
+    binary = _find_dsview_binary()
+    if not binary:
+        return {"ok": False, "error": "DSView binary not found",
+                "hint": "set DSVIEW_BINARY env or build the GUI "
+                        "(`cmake --build build_dsview -j`)"}
+
+    env = os.environ.copy()
+    env["DSVIEW_MCP_AUTOSTART"] = "1"
+    if prefer_device:
+        env["DSVIEW_DEFAULT_DEVICE"] = prefer_device
+
+    proc = _subprocess.Popen(
+        [binary],
+        env=env,
+        stdout=_subprocess.DEVNULL,
+        stderr=_subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if _gui_is_listening():
+            return {"ok": True, "already_running": False,
+                    "pid": proc.pid, "port": _GUI_PORT, "binary": binary}
+        time.sleep(0.2)
+
+    return {"ok": False, "error": "GUI did not open port 7384 in time",
+            "pid": proc.pid, "binary": binary,
+            "hint": "GUI may have failed to start; check for stale "
+                    "DSView processes or port conflicts."}
 
 
 @mcp.tool()

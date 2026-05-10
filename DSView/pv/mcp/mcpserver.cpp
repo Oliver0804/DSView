@@ -168,6 +168,8 @@ void McpServer::handleLine(QTcpSocket *sock, const QByteArray &line)
         result = toolSetCollectMode(par, &err);
     } else if (method == "get_state") {
         result = toolGetState(par, &err);
+    } else if (method == "save_session") {
+        result = toolSaveSession(par, &err);
     } else {
         writeError(sock, id, -32601,
                    QStringLiteral("Method not found: %1").arg(method));

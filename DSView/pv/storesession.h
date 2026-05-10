@@ -85,6 +85,13 @@ public:
         return _file_name;
     }
 
+    /* For programmatic saves (e.g. driven by the embedded MCP server)
+     * — bypass MakeSaveFile()'s file-dialog round-trip. */
+    inline void SetFileName(const QString &n) { _file_name = n; }
+    inline void SetSessionDataGetter(ISessionDataGetter *g) {
+        _sessionDataGetter = g;
+    }
+
     bool IsLogicDataType();
 
     inline void SetDataRange(uint64_t start_index, uint64_t end_index){
