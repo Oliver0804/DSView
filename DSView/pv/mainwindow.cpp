@@ -146,14 +146,15 @@ namespace pv
         update_title_bar_text();
 
         /* Embedded MCP server — created upfront so the log dialog can be
-         * opened at any time, but not started until the user toggles
-         * "MCP Server" in the Help menu (LogoBar). Set the env var
-         * DSVIEW_MCP_AUTOSTART=1 to bring it up automatically (handy for
-         * scripted / headless usage). */
+         * opened at any time. The server starts automatically by default
+         * so a freshly-launched DSView is immediately MCP-controllable;
+         * set DSVIEW_MCP_AUTOSTART=0 to opt out (e.g. when you want to
+         * pick a different port via the toolbar). */
         _mcp_server = new pv::mcp::McpServer(_session, this, this);
 
         QByteArray envAuto = qgetenv("DSVIEW_MCP_AUTOSTART");
-        if (!envAuto.isEmpty() && envAuto != "0") {
+        bool autostart = (envAuto != "0");  // default ON
+        if (autostart) {
             if (!_mcp_server->start(MCP_DEFAULT_PORT))
                 dsv_warn("MCP autostart failed (port %u in use?)",
                          MCP_DEFAULT_PORT);
@@ -313,8 +314,12 @@ namespace pv
         // (sits between FileBar and LogoBar so it's a peer of Display/File).
         connect(_mcp_bar, SIGNAL(sig_mcp_toggle(bool)), this, SLOT(on_mcp_toggle(bool)));
         connect(_mcp_bar, SIGNAL(sig_mcp_show_log()), this, SLOT(on_mcp_show_log()));
-        if (_mcp_server)
-            _mcp_bar->set_mcp_listening(_mcp_server->isListening());
+        if (_mcp_server) {
+            /* Wire the bar directly to the server so it auto-updates
+             * when listening flips for any reason (port-conflict
+             * fallback, programmatic stop, etc.). */
+            _mcp_bar->attach_server(_mcp_server);
+        }
 
         connect(_protocol_widget, SIGNAL(protocol_updated()), this, SLOT(on_signals_changed()));
 

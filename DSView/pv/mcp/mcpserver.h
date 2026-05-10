@@ -51,6 +51,10 @@ signals:
      * (or any other observer) can listen and append. */
     void logMessage(const QString &line);
 
+    /* Emitted whenever the listening state flips. UI widgets can connect
+     * here to re-tint their indicator without polling. */
+    void listeningChanged(bool listening);
+
 private slots:
     void onNewConnection();
     void onClientReadyRead();

@@ -145,5 +145,9 @@
         <file>icons/dark/log.svg</file>
         <file>icons/light/update.svg</file>
         <file>icons/dark/update.svg</file>
+        <file>icons/light/mcp_on.svg</file>
+        <file>icons/light/mcp_off.svg</file>
+        <file>icons/dark/mcp_on.svg</file>
+        <file>icons/dark/mcp_off.svg</file>
     </qresource>
 </RCC>

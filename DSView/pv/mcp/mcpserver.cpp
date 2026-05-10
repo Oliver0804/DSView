@@ -60,14 +60,27 @@ bool McpServer::start(quint16 port)
         .arg(_server.serverPort());
     dsv_info("MCP: %s", msg.toUtf8().data());
     log(msg);
+    emit listeningChanged(true);
     return true;
 }
 
 void McpServer::stop()
 {
     if (!_server.isListening()) return;
+
+    /* Drop any in-flight clients first so they don't sit there
+     * half-open after we close the listener — otherwise the next
+     * start() may collide with stale socket state. */
+    const auto socks = _server.findChildren<QTcpSocket *>();
+    for (QTcpSocket *s : socks) {
+        if (s->state() != QAbstractSocket::UnconnectedState)
+            s->disconnectFromHost();
+    }
+    _pending_capture = PendingCapture{};
+
     _server.close();
     log(QStringLiteral("server stopped"));
+    emit listeningChanged(false);
 }
 
 void McpServer::onNewConnection()

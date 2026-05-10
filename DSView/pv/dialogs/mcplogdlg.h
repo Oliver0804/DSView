@@ -33,15 +33,22 @@ public:
 
 public slots:
     void append_line(const QString &line);
+    void on_listening_changed(bool listening);
 
 private slots:
     void on_clear_clicked();
     void on_copy_clicked();
+    void on_toggle_clicked();
 
 private:
+    bool is_scrolled_to_bottom() const;
+    void scroll_to_bottom();
+
     QPointer<mcp::McpServer> _server;
     QPlainTextEdit          *_text       = nullptr;
-    QLabel                  *_status     = nullptr;
+    QLabel                  *_status_dot = nullptr;  // colored circle
+    QLabel                  *_status     = nullptr;  // text
+    QPushButton             *_btn_toggle = nullptr;  // Start / Stop
     QPushButton             *_btn_clear  = nullptr;
     QPushButton             *_btn_copy   = nullptr;
 };
