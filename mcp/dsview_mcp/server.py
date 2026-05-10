@@ -739,7 +739,12 @@ def list_captures(limit: int = 20) -> dict[str, Any]:
 
 
 def _analyze_one(cap: "Capture", channel: int) -> dict[str, Any]:
-    """Single-channel statistics — shared by analyze() and analyze_all()."""
+    """Single-channel statistics — shared by analyze() and analyze_all().
+
+    Returns frequency, period and a clock-likeness verdict so an LLM
+    can verify a CLK / SCK pin from the capture metadata alone, without
+    spending tokens on raw bit windows.
+    """
     bits = cap.channel_bits(channel)
     n = bits.size
     if n == 0:
@@ -767,11 +772,33 @@ def _analyze_one(cap: "Capture", channel: int) -> dict[str, Any]:
             "median": float(np.median(arr)),
         }
 
-    freq_hz = None
+    # Period from rising-edge spacing (the standard clock metric).
+    freq_hz: float | None = None
+    period_s: float | None = None
+    period_jitter_cv: float | None = None
+    period_min_s: float | None = None
+    period_max_s: float | None = None
+    is_clock = False
+
     if rising.size >= 2 and sr:
-        period_samples = float(np.median(np.diff(rising)))
-        if period_samples > 0:
-            freq_hz = sr / period_samples
+        rr = np.diff(rising).astype(np.float64)  # period samples
+        period_samples_med = float(np.median(rr))
+        if period_samples_med > 0:
+            freq_hz = sr / period_samples_med
+            period_s = 1.0 / freq_hz
+            mean_p = float(rr.mean())
+            std_p = float(rr.std())
+            period_min_s = float(rr.min()) / sr
+            period_max_s = float(rr.max()) / sr
+            if mean_p > 0:
+                period_jitter_cv = std_p / mean_p
+            # Heuristic: ≥10 rising edges, ≤10% jitter, duty within 25–75%.
+            is_clock = (
+                rising.size >= 10
+                and period_jitter_cv is not None
+                and period_jitter_cv < 0.10
+                and 0.25 < duty < 0.75
+            )
 
     return {
         "channel": channel,
@@ -784,7 +811,12 @@ def _analyze_one(cap: "Capture", channel: int) -> dict[str, Any]:
         "edges": int(edges.size),
         "rising_edges": int(rising.size),
         "falling_edges": int(falling.size),
-        "estimated_freq_hz": freq_hz,
+        "frequency_hz": freq_hz,
+        "period_s": period_s,
+        "period_min_s": period_min_s,
+        "period_max_s": period_max_s,
+        "period_jitter_cv": period_jitter_cv,
+        "is_clock": is_clock,
         "pulse_width_s": _stats(pulse_widths_s),
     }
 
@@ -795,9 +827,23 @@ def analyze(capture_id: str,
     """Compute edge / pulse / frequency stats. Accepts a single channel
     index, a list of indices, or `None` (= every enabled channel).
 
-    Use the list / None form to avoid four tool-call round-trips when
-    you want a per-channel summary across the whole bus — saves both
-    latency and tokens.
+    Per channel the return includes:
+      * `frequency_hz` / `period_s` — derived from the median rising-rising
+        spacing. Reliable for CLK/SCK-style pins.
+      * `period_min_s` / `period_max_s` — period bounds (gives jitter range).
+      * `period_jitter_cv` — coefficient of variation of rising-rising
+        periods (stddev/mean). A clean clock is < 0.05; > 0.20 is data.
+      * `is_clock` — boolean heuristic (≥10 rising edges, jitter < 10%,
+        duty 25–75%). Use as a fast prefilter, not a guarantee.
+      * `duty_cycle`, `edges`, `rising_edges`, `falling_edges`,
+        `pulse_width_s` — extra detail.
+
+    For a CLK/SCK verification pass you can stop after reading
+    `frequency_hz` + `is_clock` — no need to call `read_window` for raw
+    bits, which saves a lot of tokens.
+
+    Use the list / None form to batch a whole bus in one call instead
+    of one tool-call per channel.
 
     Args:
         capture_id: id from `capture` or `list_captures`.
@@ -805,18 +851,25 @@ def analyze(capture_id: str,
             or None (all enabled channels).
 
     Example:
-        >>> analyze(capture_id="ab12cd34", channel=0)            # one ch
-        {"channel": 0, "samples": 200000, ...}
+        >>> analyze(capture_id="ab12cd34", channel=0)
+        {"channel": 0, "frequency_hz": 1000000.0, "period_s": 1e-6,
+         "period_jitter_cv": 0.001, "is_clock": True, "duty_cycle": 0.5, ...}
 
-        >>> analyze(capture_id="ab12cd34", channel=[0, 1, 2, 3])  # batch
-        {"capture_id": "ab12cd34", "samplerate": 1000000,
+        >>> # Quick "is this a 1 MHz SPI clock?" check:
+        >>> r = analyze("ab12cd34", channel=2)
+        >>> r["is_clock"] and abs(r["frequency_hz"] - 1e6) < 1e4
+        True
+
+        >>> # Batch a 4-pin SPI bus in one call:
+        >>> analyze(capture_id="ab12cd34", channel=[0, 1, 2, 3])
+        {"capture_id": "ab12cd34", "samplerate": 1000000, "samples": 200000,
          "channels": [
-            {"channel": 0, "duty_cycle": 0.5, "estimated_freq_hz": 1000.0, ...},
-            {"channel": 1, ...},
+            {"channel": 0, "frequency_hz": 1000000.0, "is_clock": True, ...},
+            {"channel": 1, "frequency_hz": None, "is_clock": False, ...},
             ...
          ]}
 
-        >>> analyze(capture_id="ab12cd34")                      # all enabled
+        >>> analyze(capture_id="ab12cd34")  # all enabled
     """
     cap = _load_capture(capture_id)
 
