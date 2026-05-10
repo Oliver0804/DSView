@@ -121,7 +121,21 @@ def _run_helper(args: list[str], timeout: int = 60) -> dict[str, Any]:
         ) from e
 
     if not result.get("ok", False):
-        raise HelperError(result.get("error", "unknown helper error"))
+        msg = result.get("error", "unknown helper error")
+        # Make common failures actionable for the LLM.
+        if "active-device mismatch" in msg or "USB exclusion" in msg:
+            msg += ("\n\nHint: another process is holding the requested "
+                    "USB device. Try:\n"
+                    "  • If the GUI is running, gui_set_active_device("
+                    "index=0) to park it on Demo,\n"
+                    "  • call list_devices() again — handles change "
+                    "between helper spawns,\n"
+                    "  • try the other DSLogic index when two are "
+                    "attached.")
+        elif "open" in msg.lower() and "fail" in msg.lower():
+            msg += ("\n\nHint: USB busy. Wait ~2s and retry, or close "
+                    "the DSView GUI / kill stale processes.")
+        raise HelperError(msg)
     return result
 
 
@@ -221,10 +235,20 @@ def _load_capture(cap_id: str) -> Capture:
 
 @mcp.tool()
 def list_devices() -> dict[str, Any]:
-    """List currently attached DSLogic / Demo devices.
+    """List currently attached DSLogic / DSCope / Demo devices.
 
-    Returns:
-        {"devices": [{"index": int, "name": str, "handle": int}, ...]}
+    The `index` is what you pass to `capture(index=...)`. Demo Device is
+    always present (virtual driver, fixed protocol-pattern data — handy
+    as a baseline). Two same-named DSLogic Plus units only differ by
+    their `handle` (process-local pointer; values change between calls).
+
+    Example:
+        >>> list_devices()
+        {"devices": [
+            {"index": 0, "name": "Demo Device",  "handle": 4361044064},
+            {"index": 1, "name": "DSLogic PLus", "handle": 51187451296},
+            {"index": 2, "name": "DSLogic PLus", "handle": 51187451008},
+        ]}
     """
     res = _run_helper(["list-devices"], timeout=15)
     return {"devices": res.get("devices", [])}
@@ -239,6 +263,11 @@ def device_info(index: int = -1, include_disabled: bool = False) -> dict[str, An
         include_disabled: include disabled channels in the listing
             (default False — most devices expose 16 channels but only a
             handful are enabled, dropping the rest saves ~70% of tokens).
+
+    Example:
+        >>> device_info(index=1)
+        {"name": "DSLogic PLus", "samplerate": 1000000, "depth": 1000000,
+         "channels": [{"index": 0, "name": "SDA", "enabled": true}, ...]}
     """
     res = _run_helper(["device-info", "--index", str(index)], timeout=15)
     res.pop("ok", None)
@@ -287,6 +316,7 @@ def capture(
     falling_edge_clock: bool | None = None,
     max_height: str | None = None,
     confirm: bool = False,
+    name: str | None = None,
 ) -> dict[str, Any]:
     """Run a single logic capture on the selected device. **Two-step**.
 
@@ -324,6 +354,18 @@ def capture(
              for logic captures.
         confirm: must be True to actually run capture; False (default)
              returns a settings preview only.
+        name: free-form tag stored alongside the capture. Shows up in
+             `list_captures` so you (and the LLM) can find this run
+             later by name instead of the hex capture_id.
+
+    Example:
+        >>> # Step 1: dry-run to inspect settings
+        >>> capture(samplerate=1_000_000, depth=200_000, channels=[0,1])
+        {"needs_confirm": true, "preview": {...}, "hint": "..."}
+        >>> # Step 2: confirm to actually capture
+        >>> capture(samplerate=1_000_000, depth=200_000, channels=[0,1],
+        ...         vth=0.9, name="uart-bring-up", confirm=True)
+        {"capture_id": "ab12cd34", "samples": 200000, ...}
 
     Returns (confirm=False):
         {"preview": {…}, "needs_confirm": True, "hint": "..."}
@@ -353,6 +395,7 @@ def capture(
         "ext_clock": ext_clock,
         "falling_edge_clock": falling_edge_clock,
         "max_height": max_height,
+        "name": name,
     }
 
     if not confirm:
@@ -401,18 +444,45 @@ def capture(
     elapsed = time.time() - t0
 
     cap = _load_capture(cap_id)
+
+    # Persist user-supplied tag into the metadata file so list_captures
+    # can surface it without re-deriving from log/timestamp guesses.
+    if name:
+        json_path = WORKDIR / f"cap-{cap_id}.json"
+        try:
+            meta = json.loads(json_path.read_text())
+            meta["name"] = name
+            json_path.write_text(json.dumps(meta, indent=2))
+        except Exception:
+            pass
+
     return {
         "capture_id": cap_id,
         "samples": cap.samples,
         "samplerate": cap.samplerate,
         "duration_s": round(elapsed, 3),
         "channels": cap.channel_indices,
+        "name": name,
     }
 
 
 @mcp.tool()
 def list_captures(limit: int = 20) -> dict[str, Any]:
-    """List recent captures in the workdir, newest first."""
+    """List recent captures in the workdir, newest first.
+
+    Each entry surfaces the optional `name` you passed to capture(),
+    so you can find a previous run by tag instead of remembering the
+    hex capture_id.
+
+    Example:
+        >>> list_captures(limit=3)
+        {"captures": [
+            {"capture_id": "ab12cd34", "name": "uart-bring-up",
+             "samples": 200000, "samplerate": 1000000,
+             "channels": [0, 1], "device": "DSLogic PLus", ...},
+            ...
+        ], "workdir": "/Users/.../.dsview/captures"}
+    """
     items = []
     for p in sorted(WORKDIR.glob("cap-*.json"), key=lambda x: x.stat().st_mtime,
                     reverse=True)[:limit]:
@@ -422,6 +492,8 @@ def list_captures(limit: int = 20) -> dict[str, Any]:
             continue
         items.append({
             "capture_id": p.stem.removeprefix("cap-"),
+            "name": meta.get("name"),
+            "device": meta.get("active_device_name"),
             "samples": meta.get("samples_written"),
             "samplerate": meta.get("samplerate"),
             "channels": [c["index"] for c in meta.get("channels", [])
@@ -438,6 +510,13 @@ def analyze(capture_id: str, channel: int) -> dict[str, Any]:
     Args:
         capture_id: id from `capture` or `list_captures`.
         channel: channel index (0..N-1).
+
+    Example:
+        >>> analyze(capture_id="ab12cd34", channel=0)
+        {"samples": 200000, "samplerate": 1000000, "duration_s": 0.2,
+         "duty_cycle": 0.5, "edges": 4000, "rising_edges": 2000,
+         "falling_edges": 2000, "estimated_freq_hz": 10000.0,
+         "pulse_width_s": {"min": 5e-5, "median": 5e-5, ...}}
     """
     cap = _load_capture(capture_id)
     bits = cap.channel_bits(channel)
@@ -517,6 +596,12 @@ def read_window(
     Returns:
         {"bits": str of '0'/'1', "start_sample": int, "end_sample": int,
          "samplerate": int}
+
+    Example:
+        >>> read_window(capture_id="ab12cd34", channel=0, length=64)
+        {"channel": 0, "start_sample": 0, "end_sample": 64,
+         "samplerate": 1000000,
+         "bits": "0011000011001100110011001100..."}
     """
     if length <= 0:
         return {"error": "length must be > 0"}
@@ -677,6 +762,22 @@ def decode(
         {"protocol": str, "samplerate": int, "window_samples": int,
          "annotations": [{"start", "end", "class", "label", "text", "hex"?}],
          "count": int, "truncated": bool}
+
+    Example:
+        >>> # I2C on SDA=ch0, SCL=ch1
+        >>> decode(capture_id="ab12cd34", protocol="1:i2c",
+        ...        channel_map={"sda": 0, "scl": 1})
+        {"protocol": "1:i2c", ...,
+         "streams": {"data-write": "04 02 02 02 06 07",
+                     "data-read":  "4F 32 BB 32 BB 32 BB 1F FF"},
+         "events": [{"s": 45147, "l": "start", "t": "Start"}, ...]}
+
+        >>> # Got 0 annotations? Try swapping clk/cs/mosi/miso or
+        >>> # different cpol/cpha — re-call decode() with new mapping;
+        >>> # no need to re-capture.
+        >>> decode(capture_id="ab12cd34", protocol="1:spi",
+        ...        channel_map={"clk":12, "cs":13, "mosi":15, "miso":14},
+        ...        options={"cpol": 1, "cpha": 1})
     """
     cap = _load_capture(capture_id)
     bin_path = cap.bin_path
@@ -1019,6 +1120,132 @@ def gui_set_channel(channels: dict[str, bool] | None = None,
     if not p:
         return {"ok": False, "hint": "pass channels=... or index=...,enabled=..."}
     return _gui_invoke("set_channel", p)
+
+
+_WORKFLOWS = [
+    {
+        "name": "demo-baseline",
+        "purpose": "Sanity-check the whole MCP/decoder stack against "
+                   "fixed Demo Device data (deterministic — handy for "
+                   "regression / proving the wiring works).",
+        "steps": [
+            "list_devices()                       # confirm Demo at index 0",
+            "capture(index=0, samplerate=25_000_000, depth=131_072,"
+            "        channels=list(range(16)), name='demo-baseline',"
+            "        confirm=True)",
+            "decode(capture_id=..., protocol='1:i2c',"
+            "       channel_map={'sda': 0, 'scl': 1})",
+            "# expect data-write '04 02 02 02 06 07' / "
+            "data-read '4F 32 BB 32 BB 32 BB 1F FF' (fixed pattern)",
+        ],
+    },
+    {
+        "name": "real-uart",
+        "purpose": "Capture a UART line on a 1.8 V system and decode.",
+        "steps": [
+            "list_devices()",
+            "capture(index=1, samplerate=2_000_000, depth=200_000,"
+            "        channels=[0], vth=0.9, name='uart-tx',"
+            "        confirm=True)",
+            "analyze(capture_id=..., channel=0)"
+            "  # estimated_freq_hz / pulse_width to back out baudrate",
+            "decode(capture_id=..., protocol='1:uart',"
+            "       channel_map={'rxtx': 0},"
+            "       options={'baudrate': 115200, 'num_data_bits': 8})",
+        ],
+    },
+    {
+        "name": "spi-iterate-mapping",
+        "purpose": "When SPI returns 0 annotations, try alternative "
+                   "channel mappings without re-capturing.",
+        "steps": [
+            "capture(..., channels=[0,1,2,3], name='spi-probe', confirm=True)",
+            "# Try the obvious mapping first",
+            "decode(capture_id=..., protocol='1:spi',"
+            "       channel_map={'clk':0,'mosi':1,'miso':2,'cs':3},"
+            "       options={'cpol':0,'cpha':0,'cs_polarity':'active-low'})",
+            "# Got 0 byte? Swap MOSI/MISO and tweak cpol/cpha:",
+            "for clk_idx in (0,1,2,3):",
+            "    for mosi, miso in [(1,2),(2,1)]:",
+            "        decode(... channel_map={'clk':clk_idx,'mosi':mosi,...})",
+            "# read_window(capture_id=..., channel=clk_idx) shows which "
+            "  pin actually carries the clock.",
+        ],
+    },
+    {
+        "name": "interactive-with-gui",
+        "purpose": "Spin up the DSView GUI, drive it from MCP, save the "
+                   "capture as a .dsl the user can re-open.",
+        "steps": [
+            "launch_gui(prefer_device='demo')",
+            "# GUI on Demo so the USB DSLogic stays free for stdio",
+            "gui_set_config(samplerate=25_000_000, depth=131_072,"
+            "               pattern_mode='protocol')",
+            "gui_set_channel(channels={str(i): True for i in range(16)})",
+            "gui_set_collect_mode('single')",
+            "gui_instant_shot()",
+            "gui_screenshot(path='/tmp/dsv_run.png', max_width=1280)",
+            "# now show the user the screenshot + persist data:",
+            "gui_save_session(path='/tmp/dsv_run.dsl')",
+            "# returned {ok, path, bytes} — surface the path to the user",
+        ],
+    },
+    {
+        "name": "two-agents-different-devices",
+        "purpose": "Run GUI on Demo while stdio drives a real DSLogic in "
+                   "parallel — typical Claude Code session.",
+        "steps": [
+            "# 1) Start GUI on Demo so it doesn't grab the USB device",
+            "launch_gui(prefer_device='demo')",
+            "# 2) From stdio side, capture the real Plus",
+            "list_devices()",
+            "capture(index=1, samplerate=5_000_000, depth=300_000,"
+            "        channels=[0,1,2,3], name='hw-spi-burst',"
+            "        confirm=True)",
+            "# Verify metadata.active_device_name == 'DSLogic PLus'",
+            "# (capture aborts hard if libsigrok fell back to another "
+            " device due to USB exclusion).",
+        ],
+    },
+    {
+        "name": "recover-from-busy",
+        "purpose": "What to do when capture errors with 'active-device "
+                   "mismatch' or 'USB busy'.",
+        "steps": [
+            "# 1) Check who's holding it — gui_state shows the GUI's "
+            " active device:",
+            "gui_state()  # via stdio bridge if GUI is up",
+            "# 2) Park the GUI on Demo to release the USB device:",
+            "gui_set_active_device(index=0)",
+            "# 3) Retry the original stdio capture:",
+            "capture(index=1, ..., confirm=True)",
+        ],
+    },
+]
+
+
+@mcp.tool()
+def workflows() -> dict[str, Any]:
+    """Built-in 'recipe book' — tested step-by-step examples covering
+    common DSView MCP workflows. Use this when the user's request is
+    fuzzy ('show me UART traffic', 'save the capture', 'two devices at
+    once') and you want a known-good template instead of reasoning
+    from individual tool docstrings.
+
+    Each recipe has `name`, `purpose`, and a list of pseudo-Python
+    `steps` that already account for the gotchas (dry-run + confirm
+    flow, channel-map iteration, GUI-vs-stdio device exclusion, etc.).
+
+    Example:
+        >>> workflows()
+        {"recipes": [{"name": "demo-baseline", ...},
+                     {"name": "real-uart", ...},
+                     {"name": "spi-iterate-mapping", ...},
+                     {"name": "interactive-with-gui", ...},
+                     {"name": "two-agents-different-devices", ...},
+                     {"name": "recover-from-busy", ...}]}
+    """
+    return {"recipes": _WORKFLOWS}
 
 
 def main() -> None:
