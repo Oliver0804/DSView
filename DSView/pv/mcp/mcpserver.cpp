@@ -187,6 +187,18 @@ void McpServer::handleLine(QTcpSocket *sock, const QByteArray &line)
         result = toolLoadSession(par, &err);
     } else if (method == "set_channel_name") {
         result = toolSetChannelName(par, &err);
+    } else if (method == "gui_add_decoder") {
+        result = toolGuiAddDecoder(par, &err);
+    } else if (method == "gui_list_decoders") {
+        result = toolGuiListDecoders(par, &err);
+    } else if (method == "gui_remove_decoder") {
+        result = toolGuiRemoveDecoder(par, &err);
+    } else if (method == "gui_clear_decoders") {
+        result = toolGuiClearDecoders(par, &err);
+    } else if (method == "gui_restart_decoder") {
+        result = toolGuiRestartDecoder(par, &err);
+    } else if (method == "gui_decoder_annotations") {
+        result = toolGuiDecoderAnnotations(par, &err);
     } else {
         writeError(sock, id, -32601,
                    QStringLiteral("Method not found: %1").arg(method));

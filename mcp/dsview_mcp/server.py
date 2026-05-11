@@ -800,15 +800,14 @@ def _analyze_one(cap: "Capture", channel: int) -> dict[str, Any]:
                 and 0.25 < duty < 0.75
             )
 
+    # Compact per-channel result. Fields that are pure functions of
+    # others (high_samples = duty*samples, low_samples = (1-duty)*samples,
+    # edges = rising_edges + falling_edges, duration_s = samples/sr)
+    # are dropped — derive on the consumer side if needed. samples /
+    # samplerate live on the batch wrapper, not per-channel.
     return {
         "channel": channel,
-        "samples": int(n),
-        "samplerate": sr,
-        "duration_s": n / sr if sr else 0.0,
         "duty_cycle": duty,
-        "high_samples": high_count,
-        "low_samples": int(n - high_count),
-        "edges": int(edges.size),
         "rising_edges": int(rising.size),
         "falling_edges": int(falling.size),
         "frequency_hz": freq_hz,
@@ -873,10 +872,14 @@ def analyze(capture_id: str,
     """
     cap = _load_capture(capture_id)
 
-    # Single-channel request — keep the legacy flat shape.
+    # Single-channel request — keep the legacy flat shape, but inline
+    # the capture-wide samplerate/samples that the batch form factors
+    # out (so single-call clients still see them).
     if isinstance(channel, int):
         out = _analyze_one(cap, channel)
         out["capture_id"] = capture_id
+        out["samplerate"] = cap.samplerate
+        out["samples"]    = cap.samples
         return out
 
     # Batch — list[int] or None for "all enabled".

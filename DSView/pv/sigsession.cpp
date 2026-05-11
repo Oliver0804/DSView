@@ -1725,6 +1725,20 @@ namespace pv
         }
     }
 
+    bool SigSession::restart_decoder(int index)
+    {
+        auto trace = get_decoder_trace(index);
+        if (trace == NULL)
+            return false;
+        if (!have_view_data() || is_working())
+            return false;
+        remove_decode_task(trace);
+        trace->decoder()->clear();
+        add_decode_task(trace);
+        data_updated();
+        return true;
+    }
+
     void SigSession::rst_decoder_by_key_handel(void *handel)
     {
         int dex = get_trace_index_by_key_handel(handel);

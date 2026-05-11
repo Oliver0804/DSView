@@ -102,6 +102,18 @@ private:
     QJsonObject toolLoadSession(const QJsonObject &params, QString *err);
     QJsonObject toolSetChannelName(const QJsonObject &params, QString *err);
 
+    /* Live-GUI decoder management — adds / configures / removes decoders
+     * in the running DSView GUI so the wave traces show annotations the
+     * user can see. Complements the standalone decode() path used for
+     * off-screen .bin analysis. */
+    QJsonObject toolGuiAddDecoder(const QJsonObject &params, QString *err);
+    QJsonObject toolGuiListDecoders(const QJsonObject &params, QString *err);
+    QJsonObject toolGuiRemoveDecoder(const QJsonObject &params, QString *err);
+    QJsonObject toolGuiClearDecoders(const QJsonObject &params, QString *err);
+    QJsonObject toolGuiRestartDecoder(const QJsonObject &params, QString *err);
+    QJsonObject toolGuiDecoderAnnotations(const QJsonObject &params,
+                                          QString *err);
+
 private:
     QTcpServer            _server;
     SigSession           *_session;

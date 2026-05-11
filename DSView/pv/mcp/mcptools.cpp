@@ -25,6 +25,11 @@
 #include "../storesession.h"
 #include "../toolbars/samplingbar.h"
 #include "../view/view.h"
+#include "../view/decodetrace.h"
+#include "../data/decoderstack.h"
+#include "../data/decode/decoder.h"
+#include "../data/decode/annotation.h"
+#include "../data/decode/row.h"
 #include "../log.h"
 
 namespace pv {
@@ -725,6 +730,429 @@ QJsonObject McpServer::toolLoadSession(const QJsonObject &params,
     r["path"] = path;
     if (_session->get_device())
         r["device"] = _session->get_device()->name();
+    return r;
+}
+
+/* ---- live-GUI decoder control --------------------------------------- */
+
+namespace {
+
+/* DSView ships decoders with "<bus#>:<protocol>" ids (e.g. "1:i2c",
+ * "0:i2c", "1:spi") — the prefix selects which bus the decoder reads
+ * its data from. If the caller passes the bare protocol ("i2c"), try
+ * "1:" first (single-bus, the common case) then "0:" before giving up.
+ * Stack ids ("eeprom24xx") have no prefix, so an exact match is fine. */
+static srd_decoder *find_srd_decoder_by_id_raw(const QString &id)
+{
+    QByteArray idbytes = id.toUtf8();
+    for (const GSList *l = srd_decoder_list(); l; l = l->next) {
+        srd_decoder *d = (srd_decoder *)l->data;
+        if (d && d->id && !strcmp(d->id, idbytes.constData()))
+            return d;
+    }
+    return NULL;
+}
+
+static srd_decoder *find_srd_decoder_by_id(const QString &id)
+{
+    /* Try the user's id verbatim. */
+    if (auto *d = find_srd_decoder_by_id_raw(id)) return d;
+    /* Caller passed a bare protocol — try the bus-prefixed variants. */
+    if (!id.contains(':')) {
+        if (auto *d = find_srd_decoder_by_id_raw("1:" + id)) return d;
+        if (auto *d = find_srd_decoder_by_id_raw("0:" + id)) return d;
+    }
+    return NULL;
+}
+
+static const srd_channel *find_channel_by_id(const srd_decoder *dec,
+                                             const char *id)
+{
+    for (GSList *l = dec->channels; l; l = l->next) {
+        const srd_channel *c = (const srd_channel *)l->data;
+        if (c && c->id && !strcmp(c->id, id)) return c;
+    }
+    for (GSList *l = dec->opt_channels; l; l = l->next) {
+        const srd_channel *c = (const srd_channel *)l->data;
+        if (c && c->id && !strcmp(c->id, id)) return c;
+    }
+    return NULL;
+}
+
+/* Convert a JSON value to a freshly-ref'd GVariant. Type is inferred
+ * from the JSON shape — libsigrokdecode coerces from common types so
+ * "address_format": "shifted" works without the caller knowing the
+ * decoder's preferred GVariant type. */
+static GVariant *jsonvalue_to_gvariant(const QJsonValue &v)
+{
+    if (v.isBool())   return g_variant_new_boolean(v.toBool() ? TRUE : FALSE);
+    if (v.isString()) return g_variant_new_string(v.toString().toUtf8().constData());
+    if (v.isDouble()) {
+        double d = v.toDouble();
+        if (d == (qint64)d)
+            return g_variant_new_int64((qint64)d);
+        return g_variant_new_double(d);
+    }
+    return NULL;
+}
+
+/* Apply channel + option maps to a single Decoder. Returns "" on success. */
+static QString apply_decoder_config(pv::data::decode::Decoder *dec_obj,
+                                    const srd_decoder *srd_dec,
+                                    const QJsonObject &channels,
+                                    const QJsonObject &options)
+{
+    std::map<const srd_channel *, int> probes;
+    for (auto it = channels.constBegin(); it != channels.constEnd(); ++it) {
+        const srd_channel *ch = find_channel_by_id(
+            srd_dec, it.key().toUtf8().constData());
+        if (!ch) {
+            return QStringLiteral("decoder '%1' has no channel '%2'")
+                .arg(srd_dec->id).arg(it.key());
+        }
+        probes[ch] = it.value().toInt();
+    }
+    dec_obj->set_probes(probes);
+
+    for (auto it = options.constBegin(); it != options.constEnd(); ++it) {
+        GVariant *gv = jsonvalue_to_gvariant(it.value());
+        if (!gv) {
+            return QStringLiteral("option '%1' has unsupported value type")
+                .arg(it.key());
+        }
+        dec_obj->set_option(it.key().toUtf8().constData(), gv);
+    }
+    return QString();
+}
+
+} // anonymous
+
+/* gui_add_decoder({protocol, channels, options?, stack?}) — add a
+ * decoder to the running GUI so annotations show up on the wave view.
+ *   - protocol: base decoder id (e.g. "i2c", "spi", or legacy "1:i2c")
+ *   - channels: {<srd channel id>: <wire index>} — required channels
+ *     must be present, optional channels may be omitted
+ *   - options:  {<srd option id>: <value>} optional
+ *   - stack:    [{protocol, channels?, options?}, ...] upper-layer
+ *               decoders stacked on top (e.g. eeprom24xx on i2c)
+ */
+QJsonObject McpServer::toolGuiAddDecoder(const QJsonObject &params,
+                                         QString *err)
+{
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    if (_session->is_working()) {
+        if (err) *err = "device is currently capturing; call run_stop first";
+        return {};
+    }
+
+    QString proto = params.value("protocol").toString();
+    if (proto.isEmpty()) {
+        if (err) *err = "params.protocol required (decoder id)";
+        return {};
+    }
+    srd_decoder *base = find_srd_decoder_by_id(proto);
+    if (!base) {
+        if (err) *err = QStringLiteral("decoder '%1' not found "
+                                       "(see list_decoders)").arg(proto);
+        return {};
+    }
+
+    /* Build the sub_decoder list first — these Decoder objects will be
+     * adopted into the new stack by SigSession::add_decoder. */
+    std::list<pv::data::decode::Decoder *> sub_decoders;
+    QJsonArray stack = params.value("stack").toArray();
+    QStringList stack_ids;
+    for (const QJsonValue &sv : stack) {
+        QJsonObject s = sv.toObject();
+        QString sid = s.value("protocol").toString();
+        srd_decoder *sdec = find_srd_decoder_by_id(sid);
+        if (!sdec) {
+            for (auto *d : sub_decoders) delete d;
+            if (err) *err = QStringLiteral("stacked decoder '%1' not found")
+                                .arg(sid);
+            return {};
+        }
+        auto *dobj = new pv::data::decode::Decoder(sdec);
+        QString cerr = apply_decoder_config(
+            dobj, sdec,
+            s.value("channels").toObject(),
+            s.value("options").toObject());
+        if (!cerr.isEmpty()) {
+            for (auto *d : sub_decoders) delete d;
+            delete dobj;
+            if (err) *err = cerr;
+            return {};
+        }
+        sub_decoders.push_back(dobj);
+        stack_ids.append(sid);
+    }
+
+    DecoderStatus *dstatus = new DecoderStatus();
+    dstatus->m_format = (int)DecoderDataFormat::hex;
+    pv::view::Trace *trace_out = nullptr;
+
+    /* silent=true — skip the channel-config popup. We set probes
+     * ourselves below. */
+    if (!_session->add_decoder(base, true, dstatus, sub_decoders, trace_out)) {
+        delete dstatus;
+        if (err) *err = "SigSession::add_decoder() failed";
+        return {};
+    }
+
+    /* The trace returned points at the newly-created DecodeTrace whose
+     * stack().front() is the base Decoder. Configure it now. */
+    auto &traces = _session->get_decode_signals();
+    int index = (int)traces.size() - 1;
+    if (index < 0) {
+        if (err) *err = "decoder added but trace not found";
+        return {};
+    }
+    auto *trace = traces[index];
+    auto *stack_obj = trace->decoder();
+    auto *base_dec = stack_obj->stack().front();
+    QString cerr = apply_decoder_config(
+        base_dec, base,
+        params.value("channels").toObject(),
+        params.value("options").toObject());
+    if (!cerr.isEmpty()) {
+        _session->remove_decoder(index);
+        if (err) *err = cerr;
+        return {};
+    }
+
+    /* Kick off the decode worker so annotations actually populate.
+     * restart_decoder() refuses while the device is mid-capture or
+     * the view has no data — surface that so the caller can retry. */
+    bool decode_started = _session->restart_decoder(index);
+
+    /* Make sure the protocol dock + view repaint with the new trace. */
+    if (_main_window && _main_window->getEvent())
+        emit _main_window->getEvent()->signals_changed();
+
+    QJsonObject r;
+    r["ok"]         = true;
+    r["index"]      = index;
+    r["protocol"]   = QString::fromUtf8(base->id);  // echo resolved id
+    r["stack"]      = QJsonArray::fromStringList(stack_ids);
+    r["channels"]   = params.value("channels").toObject();
+    r["options"]    = params.value("options").toObject();
+    r["decode_started"] = decode_started;  // false = call gui_restart_decoder later
+    return r;
+}
+
+QJsonObject McpServer::toolGuiRestartDecoder(const QJsonObject &params,
+                                             QString *err)
+{
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    int idx = params.value("index").toInt(-1);
+    auto &traces = _session->get_decode_signals();
+    if (idx < 0 || idx >= (int)traces.size()) {
+        if (err) *err = QStringLiteral("index %1 out of range").arg(idx);
+        return {};
+    }
+    bool ok = _session->restart_decoder(idx);
+    QJsonObject r;
+    r["ok"]    = ok;
+    r["index"] = idx;
+    if (!ok)
+        r["reason"] = _session->is_working()
+            ? "device is currently capturing"
+            : "no captured data — run instant_shot / capture first";
+    return r;
+}
+
+QJsonObject McpServer::toolGuiListDecoders(const QJsonObject &params,
+                                           QString *err)
+{
+    Q_UNUSED(params); Q_UNUSED(err);
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+
+    QJsonArray arr;
+    auto &traces = _session->get_decode_signals();
+    int idx = 0;
+    for (auto *trace : traces) {
+        QJsonObject o;
+        o["index"] = idx++;
+        auto *stack_obj = trace->decoder();
+        QJsonArray stack_ids;
+        for (auto *d : stack_obj->stack()) {
+            if (d && d->decoder())
+                stack_ids.append(QString::fromUtf8(d->decoder()->id));
+        }
+        if (!stack_ids.isEmpty()) {
+            o["protocol"] = stack_ids.first().toString();
+            QJsonArray rest;
+            for (int i = 1; i < stack_ids.size(); ++i)
+                rest.append(stack_ids[i]);
+            o["stack"] = rest;
+        }
+        o["running"] = stack_obj->IsRunning();
+        o["samples_decoded"] = (qint64)stack_obj->samples_decoded();
+        arr.append(o);
+    }
+    QJsonObject r;
+    r["ok"]       = true;
+    r["count"]    = arr.size();
+    r["decoders"] = arr;
+    return r;
+}
+
+QJsonObject McpServer::toolGuiRemoveDecoder(const QJsonObject &params,
+                                            QString *err)
+{
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    int idx = params.value("index").toInt(-1);
+    auto &traces = _session->get_decode_signals();
+    if (idx < 0 || idx >= (int)traces.size()) {
+        if (err) *err = QStringLiteral("index %1 out of range (0..%2)")
+            .arg(idx).arg((int)traces.size() - 1);
+        return {};
+    }
+    _session->remove_decoder(idx);
+    if (_main_window && _main_window->getEvent())
+        emit _main_window->getEvent()->signals_changed();
+    QJsonObject r;
+    r["ok"] = true;
+    r["index"] = idx;
+    return r;
+}
+
+QJsonObject McpServer::toolGuiClearDecoders(const QJsonObject &params,
+                                            QString *err)
+{
+    Q_UNUSED(params); Q_UNUSED(err);
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    int removed = (int)_session->get_decode_signals().size();
+    _session->clear_all_decoder(true);
+    QJsonObject r;
+    r["ok"]      = true;
+    r["removed"] = removed;
+    return r;
+}
+
+/* gui_decoder_annotations({index, row?, start?, end?, limit?, format?})
+ * — extract decoded annotations from a GUI decoder so the LLM can read
+ * the bytes/events without dumping the entire raw buffer.
+ *   - index:  which trace (from gui_list_decoders)
+ *   - row:    optional row index filter (-1 / omitted = all rows)
+ *   - start/end: sample range filter (default = whole capture)
+ *   - limit:  truncate after N events (default 1000, max 20000)
+ *   - format: "list"    full dict per event (most readable)
+ *             "summary" RLE-collapsed adjacent same-text events
+ *             "compact" array-of-arrays + row legend (≈3× cheaper in
+ *                       tokens than "list" / "summary" — recommended
+ *                       once you know which fields you need)
+ */
+QJsonObject McpServer::toolGuiDecoderAnnotations(const QJsonObject &params,
+                                                 QString *err)
+{
+    if (!_session) { if (err) *err = "no SigSession"; return {}; }
+    int idx = params.value("index").toInt(-1);
+    auto &traces = _session->get_decode_signals();
+    if (idx < 0 || idx >= (int)traces.size()) {
+        if (err) *err = QStringLiteral("index %1 out of range (0..%2)")
+            .arg(idx).arg((int)traces.size() - 1);
+        return {};
+    }
+    auto *stack_obj = traces[idx]->decoder();
+
+    int     row_filter = params.value("row").toInt(-1);
+    qint64  start_s    = params.value("start").toVariant().toLongLong();
+    qint64  end_s      = params.value("end").toVariant().toLongLong();
+    int     limit      = params.value("limit").toInt(1000);
+    if (limit <= 0 || limit > 20000) limit = 1000;
+    QString fmt        = params.value("format").toString("list");
+
+    /* Walk the per-row annotation tables. DecoderStack exposes
+     * list_annotation(row, col) for index-based row access; size via
+     * list_annotation_size(row_index). */
+    QJsonArray events;
+    qint64 total = 0;
+    bool truncated = false;
+
+    auto rows_gshow = stack_obj->get_rows_gshow();
+    int row_index = 0;
+    for (auto it = rows_gshow.begin(); it != rows_gshow.end(); ++it, ++row_index) {
+        if (row_filter >= 0 && row_filter != row_index) continue;
+        const pv::data::decode::Row &row = it->first;
+        QString row_title = row.title();
+        uint64_t count = stack_obj->list_annotation_size(row_index);
+        for (uint64_t i = 0; i < count; ++i) {
+            pv::data::decode::Annotation ann;
+            if (!stack_obj->list_annotation(&ann, row_index, i)) continue;
+            qint64 s = (qint64)ann.start_sample();
+            qint64 e = (qint64)ann.end_sample();
+            if (end_s > 0 && s > end_s) continue;
+            if (start_s > 0 && e < start_s) continue;
+            ++total;
+            if ((int)events.size() >= limit) {
+                truncated = true;
+                continue;
+            }
+            const auto &texts = ann.annotations();
+            QJsonObject ev;
+            ev["row"]   = row_index;
+            ev["row_title"] = row_title;
+            ev["start"] = s;
+            ev["end"]   = e;
+            if (!texts.empty()) ev["text"] = texts.front();
+            events.append(ev);
+        }
+    }
+
+    /* RLE-collapse adjacent identical-text rows when summary mode. */
+    if ((fmt == "summary" || fmt == "compact") && events.size() > 1) {
+        QJsonArray collapsed;
+        QJsonObject cur = events.first().toObject();
+        int run = 1;
+        for (int i = 1; i < events.size(); ++i) {
+            QJsonObject e = events[i].toObject();
+            if (e["row"] == cur["row"] && e["text"] == cur["text"]) {
+                cur["end"] = e["end"]; ++run;
+            } else {
+                if (run > 1) cur["run"] = run;
+                collapsed.append(cur);
+                cur = e; run = 1;
+            }
+        }
+        if (run > 1) cur["run"] = run;
+        collapsed.append(cur);
+        events = collapsed;
+    }
+
+    QJsonObject r;
+    r["ok"]        = true;
+    r["index"]     = idx;
+    r["format"]    = fmt;
+    r["count"]     = (qint64)events.size();
+    r["total"]     = total;
+    r["truncated"] = truncated;
+
+    if (fmt == "compact") {
+        /* Array-of-arrays + row legend. Slashes the per-event byte
+         * count from ~100 → ~35 by dropping repeating key names and
+         * row titles. */
+        QJsonObject row_legend;
+        QJsonArray  tight;
+        for (const QJsonValue &v : events) {
+            QJsonObject e = v.toObject();
+            QString rk = QString::number(e["row"].toInt());
+            if (!row_legend.contains(rk))
+                row_legend[rk] = e["row_title"];
+            QJsonArray a;
+            a.append(e["row"]);
+            a.append(e["start"]);
+            a.append(e["end"]);
+            a.append(e.value("text"));
+            if (e.contains("run")) a.append(e["run"]);
+            tight.append(a);
+        }
+        r["schema"] = QJsonArray{"row", "start", "end", "text", "run?"};
+        r["rows"]   = row_legend;
+        r["events"] = tight;
+    } else {
+        r["events"] = events;
+    }
     return r;
 }
 

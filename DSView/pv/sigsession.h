@@ -220,8 +220,15 @@ public:
         return _decode_traces;
     }
 
-    void rst_decoder(int index); 
+    void rst_decoder(int index);
     void rst_decoder_by_key_handel(void *handel);
+
+    /* Programmatic counterpart of rst_decoder() — kicks off decode work
+     * on the given trace without raising the channel-config dialog.
+     * Used by the embedded MCP server so probes/options set externally
+     * actually run. Returns false if the trace doesn't exist or there's
+     * nothing to decode against. */
+    bool restart_decoder(int index);
 
     inline pv::data::DecoderModel* get_decoder_model(){
          return _decoder_model;
