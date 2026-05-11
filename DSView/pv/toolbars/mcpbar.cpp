@@ -2,6 +2,7 @@
 
 #include <QFile>
 #include <QIcon>
+#include <QToolButton>
 
 #include "../config/appconfig.h"
 #include "../mcp/mcpserver.h"
@@ -38,6 +39,24 @@ McpBar::McpBar(SigSession *session, QWidget *parent)
     addAction(_action_toggle);
     addAction(_action_log);
 
+    /* macOS's default QToolBar check style is very subtle — barely a
+     * tone shift on a checked button. Force a strong visual frame so
+     * the user can tell at a glance whether the server is on. */
+    if (auto *btn = qobject_cast<QToolButton *>(
+            widgetForAction(_action_toggle))) {
+        btn->setStyleSheet(
+            "QToolButton:checked {"
+            "  background-color: rgba(63, 204, 110, 50);"
+            "  border: 2px solid #3fcc6e;"
+            "  border-radius: 6px;"
+            "}"
+            "QToolButton {"
+            "  border: 2px solid transparent;"
+            "  border-radius: 6px;"
+            "  padding: 2px;"
+            "}");
+    }
+
     connect(_action_toggle, SIGNAL(toggled(bool)),
             this, SLOT(on_toggle(bool)));
     connect(_action_log, SIGNAL(triggered()),
@@ -66,8 +85,11 @@ void McpBar::attach_server(pv::mcp::McpServer *server)
 void McpBar::retranslateUi()
 {
     /* Plain tr() — the L_S table doesn't have entries for the MCP bar
-     * yet; using L_S would just print "missing key" warnings. */
-    _action_toggle->setText(tr("MCP"));
+     * yet; using L_S would just print "missing key" warnings. The
+     * toggle text reflects state so the running/stopped status is
+     * also legible without the icon (small toolbars / colour-blind
+     * users). */
+    _action_toggle->setText(_is_listening ? tr("MCP ●") : tr("MCP ○"));
     _action_log->setText(tr("Logs"));
     refresh_tooltip();
 }
@@ -118,6 +140,7 @@ void McpBar::set_mcp_listening(bool on)
     if (_action_toggle) {
         QSignalBlocker block(_action_toggle);
         _action_toggle->setChecked(on);
+        _action_toggle->setText(on ? tr("MCP ●") : tr("MCP ○"));
     }
     reStyle();
     refresh_tooltip();
