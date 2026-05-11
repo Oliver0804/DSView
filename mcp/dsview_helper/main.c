@@ -25,6 +25,9 @@
 #include <getopt.h>
 #include <time.h>
 #include <inttypes.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/types.h>
 
 #include <glib.h>
 #include <libsigrok-internal.h>
@@ -828,6 +831,55 @@ static int cmd_reset_device(int index,
     return 0;
 }
 
+/* ---- parent-death watchdog ------------------------------------------- */
+
+/* When the Python MCP supervisor dies abnormally (SIGKILL, crash, host
+ * reboot mid-session) the helper daemon's stdin pipe normally goes EOF
+ * and fgets() returns NULL, ending the loop. But that signal is missed
+ * if (a) the daemon was disowned into its own session, (b) it's blocked
+ * inside a libsigrok call (capture) that doesn't touch stdin, or (c)
+ * the kernel reassigns the pipe end before the read. Result: a daemon
+ * sits around forever holding the USB device, and the next DSView
+ * launch gets "Device is busy!".
+ *
+ * Defence: a tiny background thread snapshots our original parent pid
+ * and polls getppid() every second. When the parent goes away the
+ * orphan is reparented (to launchd on macOS, init on Linux) and the
+ * returned ppid changes. We then _exit() immediately so the OS reclaims
+ * the USB device — calling libsigrok cleanup from a worker thread would
+ * race with whatever the main thread is doing inside libusb. */
+
+static pid_t g_original_ppid = 0;
+
+static void *parent_death_watcher(void *arg)
+{
+    (void)arg;
+    pid_t orig = g_original_ppid;
+    if (orig <= 1) return NULL;  /* never had a real parent — nothing to watch */
+    for (;;) {
+        sleep(1);
+        pid_t now = getppid();
+        if (now != orig) {
+            fprintf(stderr,
+                    "dsview_helper: parent (pid %d) gone — exiting "
+                    "to release USB device\n", orig);
+            /* _exit skips atexit but that's intentional: libusb / glib
+             * cleanup from a non-main thread tends to crash, and OS
+             * teardown does the right thing for fd/USB anyway. */
+            _exit(0);
+        }
+    }
+    return NULL;
+}
+
+static void start_parent_death_watcher(void)
+{
+    g_original_ppid = getppid();
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, parent_death_watcher, NULL) == 0)
+        pthread_detach(tid);
+}
+
 /* ---- subcommand: daemon (long-running, fixed-bind) -------------------- */
 
 /* Tiny JSON-line scanners. The daemon protocol is one request per stdin
@@ -897,6 +949,15 @@ static int cmd_daemon(int bind_index,
                       const char *firmware_dir,
                       const char *user_data_dir)
 {
+    /* Ignore SIGPIPE so a writeto-orphaned-stdout doesn't tear us
+     * down before the fgets-EOF path can release the device. */
+    signal(SIGPIPE, SIG_IGN);
+
+    /* Fire the watchdog *before* opening the device — that way a
+     * crash window between fork() and ds_active_device_by_index()
+     * still leaves no leaked USB handle. */
+    start_parent_death_watcher();
+
     int rc = ensure_lib_init(firmware_dir, user_data_dir);
     if (rc != SR_OK) {
         emit_error("daemon: ds_lib_init failed: %s", sr_error_str(rc));
