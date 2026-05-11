@@ -1345,12 +1345,29 @@ def gui_state() -> dict[str, Any]:
 def gui_screenshot(path: str | None = None,
                    max_width: int | None = 1280) -> dict[str, Any]:
     """Save a PNG screenshot of the DSView main window. Returns the file
-    path so the caller can open it with a vision-capable model.
+    path so the caller can open it with a vision-capable model AND/OR
+    paste it into the conversation as a visual record.
+
+    Use this whenever a textual tool result alone wouldn't convey what
+    the user is actually seeing — for example:
+      * After `gui_add_decoder` so the user can verify the annotations
+        landed on the right waves
+      * After a capture finishes — wave traces + measured intervals are
+        much easier to read visually
+      * Before deleting / replacing decoders — captures "before/after"
+        for the chat log
+      * To prove a UI change took effect (a re-styled toolbar, new
+        channel name, etc.)
 
     Args:
         path: optional output file path; defaults to /tmp/dsview_screenshot_*.png.
         max_width: downscale to this width in pixels (default 1280, set to
             None or 0 to keep full resolution — full-HD PNG can be ~400KB).
+
+    Returns:
+        `{path, width, height, bytes}` — surface `path` to the user
+        so they know where the file is, or attach it to the chat to
+        let them eyeball the result.
     """
     p: dict[str, Any] = {}
     if path:                       p["path"] = path
@@ -1526,6 +1543,164 @@ def gui_save_session(path: str | None = None) -> dict[str, Any]:
     p: dict[str, Any] = {}
     if path: p["path"] = path
     return _gui_invoke("save_session", p, timeout=60)
+
+
+# ---------------------------------------------------------------------------
+# Live-GUI decoder control — manipulate DSView's protocol analyser dock
+# directly, so annotations show up on the wave traces the user is looking
+# at. Complementary to the off-screen `decode()` path, which still works
+# from a .bin file.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def gui_add_decoder(
+    protocol: str,
+    channels: dict[str, int],
+    options: dict[str, Any] | None = None,
+    stack: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Add a protocol decoder to the running DSView GUI so annotations
+    overlay the live wave traces. Equivalent to clicking "Decode → +"
+    and filling out the channel-mapping dialog, but driven from MCP.
+
+    Args:
+        protocol: decoder id from `list_decoders`. The bus prefix is
+            optional — "i2c" auto-resolves to "1:i2c" (single-bus); pass
+            "0:i2c" explicitly for the dual-bus variant.
+        channels: {<channel id from list_decoders>: <wire index>}.
+            Required channels must be present; optional ones may be
+            omitted.
+        options: optional {<option id>: value} — strings, ints, bools
+            and floats are auto-converted to the right GVariant type.
+        stack: optional list of upper-layer decoders to stack on top,
+            e.g. `[{"protocol": "eeprom24xx"}]` decodes EEPROM
+            traffic on top of an i2c base. Each entry has the same
+            {protocol, channels?, options?} shape.
+
+    Returns:
+        {ok, index, protocol, stack, channels, options, decode_started}
+        — `index` is the slot in `gui_list_decoders`. If
+        `decode_started` is False the device is mid-capture or the
+        view has no data yet; call `gui_restart_decoder(index)` after
+        the next capture finishes.
+
+    Example:
+        >>> gui_add_decoder("i2c", {"sda": 0, "scl": 1},
+        ...                 stack=[{"protocol": "eeprom24xx"}])
+        {"ok": true, "index": 0, "protocol": "1:i2c",
+         "stack": ["eeprom24xx"], "decode_started": true, ...}
+
+        >>> # Then read what got decoded:
+        >>> gui_decoder_annotations(0, format="compact", limit=200)
+    """
+    p: dict[str, Any] = {
+        "protocol": protocol,
+        "channels": channels,
+    }
+    if options: p["options"] = options
+    if stack:   p["stack"]   = stack
+    return _gui_invoke("gui_add_decoder", p, timeout=15)
+
+
+@mcp.tool()
+def gui_list_decoders() -> dict[str, Any]:
+    """List the decoders currently active in the DSView GUI.
+
+    Returns:
+        {ok, count, decoders: [{index, protocol, stack, running,
+                                samples_decoded}, ...]}
+        — `running=true` while the decode worker is still chewing
+        through samples; `samples_decoded` reaches the capture size
+        when done.
+
+    Example:
+        >>> gui_list_decoders()
+        {"ok": true, "count": 2,
+         "decoders": [
+            {"index": 0, "protocol": "1:i2c", "stack": ["eeprom24xx"],
+             "running": false, "samples_decoded": 131073},
+            {"index": 1, "protocol": "1:uart", "stack": [],
+             "running": false, "samples_decoded": 131073}
+         ]}
+    """
+    return _gui_invoke("gui_list_decoders")
+
+
+@mcp.tool()
+def gui_remove_decoder(index: int) -> dict[str, Any]:
+    """Remove a single decoder from the GUI by its `gui_list_decoders`
+    index. Indices shift after a remove — refetch the list before
+    chaining more removals."""
+    return _gui_invoke("gui_remove_decoder", {"index": int(index)})
+
+
+@mcp.tool()
+def gui_clear_decoders() -> dict[str, Any]:
+    """Drop ALL decoders from the GUI. Useful before adding a fresh
+    set so the user isn't looking at stale annotations from a previous
+    session. Returns `{ok, removed: <count>}`."""
+    return _gui_invoke("gui_clear_decoders")
+
+
+@mcp.tool()
+def gui_restart_decoder(index: int) -> dict[str, Any]:
+    """Re-run the decode worker on an existing decoder — call this
+    after a new capture if `gui_add_decoder` returned
+    `decode_started: false`, or after changing channel mappings via
+    `gui_add_decoder` + manual re-add.
+
+    Returns `{ok, index, reason?}`. `reason` is populated when ok is
+    false (device still capturing, or no view data)."""
+    return _gui_invoke("gui_restart_decoder", {"index": int(index)})
+
+
+@mcp.tool()
+def gui_decoder_annotations(
+    index: int,
+    row: int | None = None,
+    start: int | None = None,
+    end: int | None = None,
+    limit: int = 1000,
+    format: str = "compact",
+) -> dict[str, Any]:
+    """Read decoded annotations from a GUI decoder so the LLM can see
+    the bytes/events without dumping raw bits.
+
+    Args:
+        index: from `gui_list_decoders`.
+        row: optional row-index filter. Omit for all rows.
+        start / end: sample-range filter. Omit for the whole capture.
+        limit: cap on returned events (default 1000, max 20000).
+        format: output shape — pick the cheapest you can use.
+            • "compact" (default, recommended): array-of-arrays plus a
+              row-id legend. Each event is `[row, start, end, text, run?]`.
+              On a 50-event sample this is 1590 B vs 4983 B for "list" —
+              **3× cheaper in tokens**.
+            • "summary": dict-per-event with adjacent same-text events
+              RLE-collapsed into one entry that grows a `run` count.
+            • "list": dict-per-event, no collapsing. Most readable but
+              also the chattiest.
+
+    Example:
+        >>> gui_decoder_annotations(0, format="compact", limit=100)
+        {"ok": true, "format": "compact",
+         "rows": {"0": "24xx EEPROM: Bits/bytes"},
+         "schema": ["row", "start", "end", "text", "run?"],
+         "events": [[0, 45605, 52495, "Control word", 2],
+                    [0, 47860, 49865, "Word address"],
+                    [0, 52746, 54751, "Data"], ...],
+         "count": 15, "total": 200, "truncated": true}
+
+        >>> # Narrow to just one row index:
+        >>> gui_decoder_annotations(0, row=1, format="compact")
+    """
+    p: dict[str, Any] = {"index": int(index), "limit": int(limit),
+                          "format": format}
+    if row   is not None: p["row"]   = int(row)
+    if start is not None: p["start"] = int(start)
+    if end   is not None: p["end"]   = int(end)
+    return _gui_invoke("gui_decoder_annotations", p, timeout=15)
 
 
 # ---------------------------------------------------------------------------
@@ -2005,6 +2180,51 @@ _WORKFLOWS = [
             "# 3) Got 0 bytes? Swap MOSI/MISO and tweak cpol/cpha:",
             "for mosi, miso in [(1,2),(2,1)]:",
             "    decode(... channel_map={'clk':clk_idx,'mosi':mosi,...})",
+        ],
+    },
+    {
+        "name": "gui-decode-and-show",
+        "purpose": "End-to-end: capture in the live GUI, add a protocol "
+                   "decoder so the user can see annotations on the wave "
+                   "traces, read the decoded events back to the LLM, and "
+                   "snap a screenshot for the conversation log.",
+        "steps": [
+            "# 1) Make sure the GUI has fresh data on screen:",
+            "gui_instant_shot()                       # or run_start/run_stop",
+            "",
+            "# 2) Optional — figure out which pins are CLK / data so the",
+            "# channel map is grounded in measurement instead of guesses.",
+            "# stats = analyze(latest_capture_id, [0,1,2,3])",
+            "# clk_idx = next(c['channel'] for c in stats['channels']",
+            "#               if c.get('is_clock'))",
+            "",
+            "# 3) Wipe any stale decoders and add the one you want.",
+            "# 'i2c' auto-resolves to '1:i2c'. Stack eeprom24xx on top",
+            "# to decode 24Cxx EEPROM transactions from the bus traffic.",
+            "gui_clear_decoders()",
+            "r = gui_add_decoder('i2c',",
+            "                    channels={'sda': 0, 'scl': 1},",
+            "                    stack=[{'protocol': 'eeprom24xx'}])",
+            "# If r['decode_started'] is False, the device is still",
+            "# capturing — call gui_restart_decoder(r['index']) after.",
+            "",
+            "# 4) Read decoded events back. Default format='compact'",
+            "# packs each event as [row, start, end, text, run?] and",
+            "# pulls row titles into a legend — ~3× cheaper than 'list'.",
+            "events = gui_decoder_annotations(r['index'], limit=200)",
+            "# events['rows']   -> {'0': '24xx EEPROM: Bits/bytes', ...}",
+            "# events['events'] -> [[0, 45605, 52495, 'Control word', 2], ...]",
+            "",
+            "# 5) Screenshot the GUI so the user (or this chat) has a",
+            "# visual record of what the wave + annotations actually",
+            "# look like. Surface the path back to the user.",
+            "shot = gui_screenshot(max_width=1280)",
+            "# shot -> {'path': '/tmp/dsview_screenshot_XXXX.png',",
+            "#         'width': 1280, 'height': 759, 'bytes': 76805}",
+            "",
+            "# 6) (Optional) Persist the whole session so the user can",
+            "# reopen it manually in DSView:",
+            "gui_save_session('/tmp/i2c_eeprom_run.dsl')",
         ],
     },
     {
